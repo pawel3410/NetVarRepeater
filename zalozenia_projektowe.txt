@@ -1,0 +1,13 @@
+- program kompilowany w codeblocks, podaj wymagane opcje kompilacji,
+-program przekazujacy odebrane pakiety UDP z jednego interfejsu sieciowego z okreslonego portu odbiorczego na inny interfejs sieciowy pod wskazany adres ip i port,
+- konfiguracja w pliku o nastepujacym formacie:
+ip_nadawcy, port n aktórym odebrano pakiet, ip na który ma byc przekazany, port na ktory ma byc przekazany,
+- ip nadawcy może byc 0.0.0.0 jezeli pakiet został nadany jako broadcast, ip n aktory ma byc przekazany takze moze byc broadcast,
+- wykozystanie windivert w taki sposób aby port na ktorym nasluchujemy nie był blokowany dla innych programów,
+- po najechaniu kursorem na ikonke w systray ma byc wyswietlona liczba odczytanych i przekazanych pakietów a takze bledow wyslania dla kazdej konfiguracji, czas działania i czas rozpoczecia działania, po kliknieciu prawym przyciskiem myszy pokaze sie menu z konfiguracja ktora mozna edytowac, start (wczytuje konfiguracje gdyby sie zmieniła), stop, reset (wczytuje na nowo konfiguracje i resetuje liczniki),
+
+przykładowa konfiguracja:
+0.0.0.0 1202 192.168.1.10 1203
+10.0.0.1 1203 192.170.10.3 1203
+0.0.0.0 1202 192.170.10.4 1202
+10.0.0.1 1203 255.255.255.255.1203
