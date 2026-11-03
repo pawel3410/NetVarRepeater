@@ -22,12 +22,14 @@ Program dla Windows 10/11 (x64), który **kopiuje odebrane datagramy UDP** z wyb
 - **Port nasłuchu nie jest blokowany**: WinDivert pracuje w trybie `SNIFF` (kopia pakietu), a program nigdy nie wykonuje `bind()` na porcie odbiorczym. Oryginalny pakiet trafia normalnie do innych programów.
 - Usługa startuje automatycznie z systemem (`start= auto`, konto SYSTEM) i od razu zaczyna przekazywać pakiety; restartuje się po awarii.
 - **Najechanie na ikonę**: okno z informacją o stanie, czasie rozpoczęcia, czasie działania oraz – dla każdej reguły – liczbą pakietów odebranych, przekazanych i błędów wysyłania (plus wybrany interfejs wyjściowy).
+- Dla każdej reguły okno pokazuje też **kartę odbierającą** i **karty wysyłające**: nazwę, adres IPv4 i indeks interfejsu (np. `Ethernet 2 (192.168.1.5) [if 12]`).
 - **Prawy przycisk** – menu:
   - lista reguł z pliku konfiguracji (kliknięcie otwiera edytor), `Edytuj konfigurację...`,
   - **Start** – wczytuje konfigurację ponownie i (re)startuje przekazywanie (liczniki niezmienionych reguł są zachowane),
   - **Stop** – zatrzymuje przekazywanie (usługa działa dalej),
   - **Reset** – wczytuje konfigurację, zeruje liczniki i czas startu (stan Start/Stop pozostaje bez zmian),
   - `Zamknij ikonę`.
+- Ikona ma napis „NV” (na ikonie 16×16 nie zmieści się pełna nazwa); pełne „NetVar repeater” jest w tooltipie, oknie statystyk i tytułach okien.
 - Kolor ikony: szary – usługa niedostępna, pomarańczowy – zatrzymany, zielony – aktywny, czerwony – aktywny, ale wystąpiły błędy wysyłania.
 - Podwójne kliknięcie ikony otwiera edytor konfiguracji.
 
@@ -67,7 +69,7 @@ W konfiguracji nie podaje się interfejsów, więc program wyznacza je sam, osob
 | zwykły unicast | interfejs wskazany przez tablicę routingu (`GetBestInterfaceEx`) |
 | brak dopasowania (np. adres lokalny) | wybiera system |
 
-Gniazdo wyjściowe jest **przypięte do interfejsu** dwoma mechanizmami naraz: `bind()` na adres IP interfejsu (poprawny adres źródłowy) oraz `IP_UNICAST_IF` (wymuszenie interfejsu także dla broadcastu, gdzie sama trasa byłaby niejednoznaczna). Włączone jest `SO_BROADCAST`. Wybrany tryb i indeks interfejsu widać w oknie statystyk.
+Gniazdo wyjściowe jest **przypięte do interfejsu** dwoma mechanizmami naraz: `bind()` na adres IP interfejsu (poprawny adres źródłowy) oraz `IP_UNICAST_IF` (wymuszenie interfejsu także dla broadcastu, gdzie sama trasa byłaby niejednoznaczna). Włączone jest `SO_BROADCAST`. Wybrany tryb, nazwa karty, jej adres IP i indeks interfejsu (odbiorczego i wysyłających) widać w oknie statystyk. Karta odbiorcza jest zapamiętywana z ostatniego pakietu danej reguły, więc do czasu pierwszego pakietu widnieje „jeszcze brak pakietów”. Przy broadcast `255.255.255.255` raportowanych jest do 4 kart wysyłających.
 
 Przekazywana jest **zawartość datagramu (payload)** w nowym pakiecie UDP – adres i port źródłowy są inne niż w oryginale (źródło = adres interfejsu wyjściowego, port efemeryczny).
 
