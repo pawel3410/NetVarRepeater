@@ -12,6 +12,7 @@
 
 static const uint32_t NVR_MAGIC     = 0x3152564E;  // "NVR1"
 static const uint32_t NVR_MAX_RULES = 256;
+static const uint32_t NVR_MAX_TX_SHOW = 4;   // ile interfejsow wysylajacych raportujemy na regule
 
 enum NvrCommand : uint32_t
 {
@@ -52,6 +53,13 @@ struct NvrReplyHeader
     char     message[192];      // opis stanu / pierwszy blad konfiguracji (UTF-8 lub ASCII)
 };
 
+struct NvrIfInfo
+{
+    uint32_t ifIdx;             // indeks interfejsu (0 = nieznany / brak)
+    uint32_t ip;                // pierwszy adres IPv4 interfejsu, host order (0 = brak)
+    wchar_t  name[40];          // nazwa karty (FriendlyName), np. "Ethernet 2"
+};
+
 struct NvrRuleStatus
 {
     uint32_t srcIp;             // host order, 0 = dowolny nadawca
@@ -66,6 +74,9 @@ struct NvrRuleStatus
     uint64_t forwarded;
     uint64_t bytesForwarded;
     uint64_t errors;
+    NvrIfInfo rxIf;             // interfejs, na ktorym ostatnio odebrano pakiet tej reguly
+    uint32_t  txShown;          // ile pozycji txIf jest wypelnionych
+    NvrIfInfo txIf[NVR_MAX_TX_SHOW];   // interfejsy wysylajace
 };
 
 #pragma pack(pop)
