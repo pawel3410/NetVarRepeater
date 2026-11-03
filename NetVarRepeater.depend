@@ -1,0 +1,29 @@
+# depslib dependency file v1.0
+1793686672 source:c:\data\programowanie\github\netvarrepeater\service.cpp
+	<winsock2.h>
+	<ws2tcpip.h>
+	<iphlpapi.h>
+	<windows.h>
+	<sddl.h>
+	<atomic>
+	<cstdint>
+	<cstdio>
+	<cstring>
+	<memory>
+	<set>
+	<string>
+	<vector>
+	"common.h"
+	"config.h"
+
+1793686672 c:\data\programowanie\github\netvarrepeater\common.h
+	<cstdint>
+	<string>
+	<windows.h>
+
+1793686672 c:\data\programowanie\github\netvarrepeater\config.h
+	<cstdint>
+	<cstdio>
+	<string>
+	<vector>
+
