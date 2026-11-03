@@ -60,6 +60,7 @@
 			<Add option="-std=c++17" />
 			<Add option="-Wall" />
 			<Add option="-Wextra" />
+			<Add option="-Wno-cast-function-type" />
 			<Add option="-m64" />
 			<Add option="-D_WIN32_WINNT=0x0601" />
 		</Compiler>
