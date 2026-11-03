@@ -1,27 +1,22 @@
 # depslib dependency file v1.0
-1793686672 source:c:\data\programowanie\github\netvarrepeater\service.cpp
-	<winsock2.h>
-	<ws2tcpip.h>
-	<iphlpapi.h>
+1793747767 source:c:\data\programowanie\github\netvarrepeater\tray.cpp
 	<windows.h>
-	<sddl.h>
-	<atomic>
+	<windowsx.h>
+	<shellapi.h>
 	<cstdint>
-	<cstdio>
+	<cwchar>
 	<cstring>
-	<memory>
-	<set>
 	<string>
 	<vector>
 	"common.h"
 	"config.h"
 
-1793686672 c:\data\programowanie\github\netvarrepeater\common.h
+1793747767 c:\data\programowanie\github\netvarrepeater\common.h
 	<cstdint>
 	<string>
 	<windows.h>
 
-1793686672 c:\data\programowanie\github\netvarrepeater\config.h
+1793747767 c:\data\programowanie\github\netvarrepeater\config.h
 	<cstdint>
 	<cstdio>
 	<string>
