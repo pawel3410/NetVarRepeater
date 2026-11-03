@@ -84,6 +84,8 @@ struct Rule
     std::atomic<uint32_t> outMode;
     std::atomic<uint32_t> outIfIdx;
     std::atomic<uint32_t> outCount;
+    std::atomic<uint32_t> lastRxIf;
+    std::atomic<uint32_t> txIf[NVR_MAX_TX_SHOW];
     std::atomic<uint32_t> lastError;
     std::atomic<uint64_t> received;
     std::atomic<uint64_t> forwarded;
@@ -91,9 +93,11 @@ struct Rule
     std::atomic<uint64_t> errors;
 
     explicit Rule(const NvrRuleCfg& c)
-        : cfg(c), outMode(NVR_OUT_OS), outIfIdx(0), outCount(0), lastError(0),
+        : cfg(c), outMode(NVR_OUT_OS), outIfIdx(0), outCount(0), lastRxIf(0), lastError(0),
           received(0), forwarded(0), bytes(0), errors(0)
     {
+        for (uint32_t i = 0; i < NVR_MAX_TX_SHOW; ++i)
+            txIf[i].store(0);
         std::memset(&dst, 0, sizeof(dst));
         dst.sin_family = AF_INET;
         dst.sin_port = htons(c.dstPort);
@@ -106,7 +110,16 @@ struct Rule
             if (outs[i].s != INVALID_SOCKET)
                 closesocket(outs[i].s);
         outs.clear();
-        outCount.store(0);
+        PublishTx();
+    }
+
+    // Publikuje liste interfejsow wysylajacych (czytana przez watek pipe)
+    void PublishTx()
+    {
+        const uint32_t n = static_cast<uint32_t>(outs.size());
+        for (uint32_t i = 0; i < NVR_MAX_TX_SHOW; ++i)
+            txIf[i].store(i < n ? outs[i].ifIdx : 0);
+        outCount.store(n);
     }
 
     ~Rule() { CloseSockets(); }
@@ -196,7 +209,10 @@ struct IfAddr
     uint32_t ifIdx;
     uint32_t ip;      // host order
     uint32_t mask;    // host order
+    std::wstring name;
 };
+
+static std::vector<IfAddr> g_ifTable;   // ostatnio wyliczone interfejsy (pod g_dataCs)
 
 // Lista adresow IPv4 interfejsow, ktore sa UP i nie sa loopbackiem.
 static std::vector<IfAddr> EnumInterfaces()
@@ -213,7 +229,7 @@ static std::vector<IfAddr> EnumInterfaces()
         rc = GetAdaptersAddresses(
             AF_INET,
             GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-            GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_FRIENDLY_NAME,
+            GAA_FLAG_SKIP_DNS_SERVER,
             nullptr,
             reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()),
             &size);
@@ -239,6 +255,7 @@ static std::vector<IfAddr> EnumInterfaces()
             const sockaddr_in* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
             IfAddr ia;
             ia.ifIdx = a->IfIndex;
+            ia.name = a->FriendlyName ? a->FriendlyName : L"";
             ia.ip = ntohl(sin->sin_addr.s_addr);
 
             unsigned prefix = u->OnLinkPrefixLength;
@@ -313,7 +330,7 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
             }
         }
         r.outMode.store(NVR_OUT_BCAST_ALL);
-        r.outCount.store(static_cast<uint32_t>(r.outs.size()));
+        r.PublishTx();
         return;
     }
 
@@ -333,7 +350,7 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
                 r.outs.push_back(o);
                 r.outMode.store(NVR_OUT_BOUND);
                 r.outIfIdx.store(ia.ifIdx);
-                r.outCount.store(1);
+                r.PublishTx();
                 return;
             }
         }
@@ -355,7 +372,7 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
                 r.outs.push_back(o);
                 r.outMode.store(NVR_OUT_BOUND);
                 r.outIfIdx.store(ifs[i].ifIdx);
-                r.outCount.store(1);
+                r.PublishTx();
                 return;
             }
         }
@@ -368,7 +385,7 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
         OutSock o = { s, 0 };
         r.outs.push_back(o);
     }
-    r.outCount.store(static_cast<uint32_t>(r.outs.size()));
+    r.PublishTx();
 }
 
 // ------------------------------------------------------------
@@ -463,6 +480,11 @@ static void ForwardOne(Rule& r, const unsigned char* payload, UINT plen,
 static void RefreshOutputs()
 {
     const std::vector<IfAddr> ifs = EnumInterfaces();
+
+    EnterCriticalSection(&g_dataCs);
+    g_ifTable = ifs;
+    LeaveCriticalSection(&g_dataCs);
+
     for (size_t i = 0; i < g_rules.size(); ++i)
         BuildOutputs(*g_rules[i], ifs);
 }
@@ -519,6 +541,7 @@ static DWORD WINAPI RelayThread(void*)
 
             matched = true;
             r.received.fetch_add(1);
+            r.lastRxIf.store(addr.ifIdx);
             ForwardOne(r, payload, plen, addr.ifIdx, needRefresh);
         }
 
@@ -793,6 +816,28 @@ static DWORD EngineCommand(uint32_t cmd)
 // ------------------------------------------------------------
 // Serwer named pipe (tray <-> usluga)
 // ------------------------------------------------------------
+// Uzupelnia opis interfejsu z tabeli g_ifTable (wolac pod g_dataCs).
+static void FillIf(NvrIfInfo& out, uint32_t ifIdx)
+{
+    std::memset(&out, 0, sizeof(out));
+    out.ifIdx = ifIdx;
+
+    if (ifIdx == 0)
+        return;
+
+    for (size_t i = 0; i < g_ifTable.size(); ++i)
+    {
+        if (g_ifTable[i].ifIdx != ifIdx)
+            continue;
+
+        out.ip = g_ifTable[i].ip;
+        const size_t n = g_ifTable[i].name.size() < 39 ? g_ifTable[i].name.size() : 39;
+        for (size_t k = 0; k < n; ++k)
+            out.name[k] = g_ifTable[i].name[k];
+        return;
+    }
+}
+
 static uint32_t BuildReply(std::vector<unsigned char>& out, DWORD commandResult)
 {
     out.assign(NVR_MAX_REPLY, 0);
@@ -830,6 +875,14 @@ static uint32_t BuildReply(std::vector<unsigned char>& out, DWORD commandResult)
         rs[n].forwarded = r.forwarded.load();
         rs[n].bytesForwarded = r.bytes.load();
         rs[n].errors = r.errors.load();
+
+        FillIf(rs[n].rxIf, r.lastRxIf.load());
+
+        uint32_t shown = r.outCount.load();
+        if (shown > NVR_MAX_TX_SHOW) shown = NVR_MAX_TX_SHOW;
+        rs[n].txShown = shown;
+        for (uint32_t k = 0; k < shown; ++k)
+            FillIf(rs[n].txIf[k], r.txIf[k].load());
     }
 
     LeaveCriticalSection(&g_dataCs);
