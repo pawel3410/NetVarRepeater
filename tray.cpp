@@ -51,7 +51,7 @@ static const UINT ID_RESET      = 2004;
 static const UINT ID_EXIT       = 2005;
 static const UINT ID_RULE_BASE  = 3000;
 
-static const wchar_t* APP_TITLE = L"NetVarRepeater";
+static const wchar_t* APP_TITLE = L"NetVar repeater";
 
 // ------------------------------------------------------------
 // Stan
@@ -241,29 +241,30 @@ static HICON MakeIcon(COLORREF color)
     HBITMAP bmpMask = CreateBitmap(sz, sz, 1, 1, nullptr);
 
     HGDIOBJ old = SelectObject(mem, bmpColor);
-    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
     RECT rc = { 0, 0, sz, sz };
+
+    HBRUSH bg = CreateSolidBrush(color);
     FillRect(mem, &rc, bg);
     DeleteObject(bg);
 
-    HBRUSH fg = CreateSolidBrush(color);
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(40, 40, 40));
-    HGDIOBJ ob = SelectObject(mem, fg);
-    HGDIOBJ op = SelectObject(mem, pen);
-    Ellipse(mem, 1, 1, sz - 1, sz - 1);
-    SelectObject(mem, ob);
-    SelectObject(mem, op);
-    DeleteObject(fg);
-    DeleteObject(pen);
+    HBRUSH frame = CreateSolidBrush(RGB(25, 25, 25));
+    FrameRect(mem, &rc, frame);
+    DeleteObject(frame);
+
+    // Na ikonie 16x16 miesci sie tylko skrot "NV"; pelna nazwa "NetVar repeater"
+    // jest w tooltipie, oknie statystyk i tytulach okien.
+    HFONT font = CreateFontW(-(sz * 11 / 16), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    HGDIOBJ oldFont = SelectObject(mem, font);
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, RGB(255, 255, 255));
+    DrawTextW(mem, L"NV", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(mem, oldFont);
+    DeleteObject(font);
 
     SelectObject(mem, bmpMask);
-    PatBlt(mem, 0, 0, sz, sz, WHITENESS);                  // 1 = przezroczyste
-    HGDIOBJ ob2 = SelectObject(mem, GetStockObject(BLACK_BRUSH));
-    HGDIOBJ op2 = SelectObject(mem, GetStockObject(NULL_PEN));
-    Ellipse(mem, 1, 1, sz, sz);                            // 0 = widoczne
-    SelectObject(mem, ob2);
-    SelectObject(mem, op2);
-
+    PatBlt(mem, 0, 0, sz, sz, BLACKNESS);                  // 0 = cala ikona widoczna
     SelectObject(mem, old);
 
     ICONINFO ii;
@@ -300,9 +301,9 @@ static void ApplyIconState(bool force)
     g_iconState = st;
     g_nid.hIcon = g_icons[st];
 
-    const wchar_t* tip = st == 0 ? L"NetVarRepeater - usluga niedostepna"
-                       : st == 1 ? L"NetVarRepeater - zatrzymany"
-                       :           L"NetVarRepeater - aktywny";
+    const wchar_t* tip = st == 0 ? L"NetVar repeater - usluga niedostepna"
+                       : st == 1 ? L"NetVar repeater - zatrzymany"
+                       :           L"NetVar repeater - aktywny";
     std::wcsncpy(g_nid.szTip, tip, 127);
     g_nid.szTip[127] = 0;
 
@@ -319,7 +320,7 @@ static void AddTrayIcon()
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_icons[g_iconState < 0 ? 0 : g_iconState];
-    std::wcscpy(g_nid.szTip, L"NetVarRepeater");
+    std::wcscpy(g_nid.szTip, L"NetVar repeater");
 
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
@@ -332,14 +333,31 @@ static void AddTrayIcon()
 // ------------------------------------------------------------
 // Okienko ze statystykami (zamiast tooltipa)
 // ------------------------------------------------------------
+static std::wstring IfText(const NvrIfInfo& i)
+{
+    if (i.ifIdx == 0)
+        return L"(nieznany)";
+
+    wchar_t nm[40];
+    for (int k = 0; k < 40; ++k)
+        nm[k] = i.name[k];
+    nm[39] = 0;
+
+    std::wstring s = nm[0] ? std::wstring(nm) : std::wstring(L"interfejs");
+    if (i.ip != 0)
+        s += L" (" + W(NvrIpToString(i.ip)) + L")";
+    s += L" [if " + Num(i.ifIdx) + L"]";
+    return s;
+}
+
 static std::wstring BuildPopupText()
 {
     const Snapshot& s = g_snap;
 
     if (!s.ok)
-        return L"NetVarRepeater\r\nUsluga nie odpowiada (zatrzymana lub niezainstalowana).";
+        return L"NetVar repeater\r\nUsluga nie odpowiada (zatrzymana lub niezainstalowana).";
 
-    std::wstring t = L"NetVarRepeater - ";
+    std::wstring t = L"NetVar repeater - ";
     t += s.h.active ? L"AKTYWNY" : L"ZATRZYMANY";
     t += L"\r\n";
 
@@ -375,13 +393,29 @@ static std::wstring BuildPopupText()
         if (r.errors > 0 && r.lastError != 0)
             t += L" (" + Num(r.lastError) + L")";
 
-        t += L"\r\n     wyjscie: ";
-        if (r.outMode == NVR_OUT_BOUND)
-            t += L"interfejs " + Num(r.outIfIdx);
-        else if (r.outMode == NVR_OUT_BCAST_ALL)
-            t += L"broadcast na " + Num(r.outCount) + L" interf. (bez odbiorczego)";
+        t += L"\r\n     odbior: ";
+        if (r.rxIf.ifIdx != 0)
+            t += IfText(r.rxIf);
         else
-            t += L"wybor systemu";
+            t += L"(jeszcze brak pakietow)";
+
+        t += L"\r\n     wysylanie: ";
+        if (r.outMode == NVR_OUT_OS || r.txShown == 0)
+        {
+            t += L"wybor systemu (trasa domyslna)";
+        }
+        else
+        {
+            for (uint32_t k = 0; k < r.txShown; ++k)
+            {
+                if (k) t += L", ";
+                t += IfText(r.txIf[k]);
+            }
+            if (r.outCount > r.txShown)
+                t += L" +" + Num(r.outCount - r.txShown) + L" wiecej";
+            if (r.outMode == NVR_OUT_BCAST_ALL)
+                t += L"  (bez interfejsu odbiorczego)";
+        }
     }
 
     if (s.rules.size() > maxShow)
@@ -715,7 +749,7 @@ static void OpenEditor()
         return;
     }
 
-    g_editor = CreateWindowExW(0, L"NvrEditor", L"NetVarRepeater - konfiguracja",
+    g_editor = CreateWindowExW(0, L"NvrEditor", L"NetVar repeater - konfiguracja",
                                WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
                                nullptr, nullptr, g_inst, nullptr);
     if (g_editor)
@@ -894,10 +928,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              FIXED_PITCH | FF_MODERN, L"Consolas");
 
-    g_icons[0] = MakeIcon(RGB(140, 140, 140));   // niedostepna
-    g_icons[1] = MakeIcon(RGB(240, 160, 30));    // zatrzymana
-    g_icons[2] = MakeIcon(RGB(40, 180, 60));     // aktywna
-    g_icons[3] = MakeIcon(RGB(215, 45, 45));     // aktywna z bledami
+    g_icons[0] = MakeIcon(RGB(110, 110, 110));   // niedostepna
+    g_icons[1] = MakeIcon(RGB(200, 115, 0));    // zatrzymana
+    g_icons[2] = MakeIcon(RGB(25, 135, 50));     // aktywna
+    g_icons[3] = MakeIcon(RGB(190, 30, 30));     // aktywna z bledami
 
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
