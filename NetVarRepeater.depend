@@ -22,3 +22,20 @@
 	<string>
 	<vector>
 
+1793748909 source:c:\data\programowanie\github\netvarrepeater\service.cpp
+	<winsock2.h>
+	<ws2tcpip.h>
+	<iphlpapi.h>
+	<windows.h>
+	<sddl.h>
+	<atomic>
+	<cstdint>
+	<cstdio>
+	<cstring>
+	<memory>
+	<set>
+	<string>
+	<vector>
+	"common.h"
+	"config.h"
+
