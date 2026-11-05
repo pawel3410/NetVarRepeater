@@ -1,9 +1,9 @@
 // ============================================================
-// NetVarRepeaterTray - ikona w zasobniku systemowym (klient uslugi)
+// NetVarRepeaterTray - ikona w zasobniku (klient uslugi)
 //
-//  - najechanie kursorem: okienko ze statystykami kazdej reguly,
-//    czasem rozpoczecia i czasem dzialania,
-//  - prawy przycisk: menu (konfiguracja, edycja, Start / Stop / Reset),
+//  - najechanie kursorem: zwarte okienko ze statystykami,
+//  - klikniecie ikony:    okno statusu (tabela regul, przyciski),
+//  - prawy przycisk:      menu (konfiguracja, edycja, Start / Stop / Reset),
 //  - komunikacja z usluga przez named pipe (common.h).
 // ============================================================
 
@@ -18,17 +18,26 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <shellapi.h>
 
 #include <cstdint>
-#include <cwchar>
+#include <cstdio>
 #include <cstring>
+#include <cwchar>
+#include <cwctype>
 #include <string>
 #include <vector>
 
 #include "common.h"
 #include "config.h"
 
+#ifndef NIN_SELECT
+#define NIN_SELECT     (WM_USER + 0)
+#endif
+#ifndef NIN_KEYSELECT
+#define NIN_KEYSELECT  (WM_USER + 1)
+#endif
 #ifndef NIN_POPUPOPEN
 #define NIN_POPUPOPEN  (WM_USER + 6)
 #endif
@@ -38,18 +47,19 @@
 #ifndef NOTIFYICON_VERSION_4
 #define NOTIFYICON_VERSION_4 4
 #endif
-#ifndef NIF_SHOWTIP
-#define NIF_SHOWTIP 0x00000080
-#endif
 
-static const UINT WM_TRAY       = WM_APP + 1;
-static const UINT_PTR ID_TIMER  = 1;
-static const UINT ID_EDIT       = 2001;
-static const UINT ID_START      = 2002;
-static const UINT ID_STOP       = 2003;
-static const UINT ID_RESET      = 2004;
-static const UINT ID_EXIT       = 2005;
-static const UINT ID_RULE_BASE  = 3000;
+static const UINT WM_TRAY      = WM_APP + 1;
+static const UINT WM_CMD_DONE  = WM_APP + 2;
+static const UINT_PTR ID_TIMER = 1;
+static const UINT_PTR ID_PROMO = 2;
+
+static const UINT ID_STATUSWIN = 2000;
+static const UINT ID_EDIT      = 2001;
+static const UINT ID_START     = 2002;
+static const UINT ID_STOP      = 2003;
+static const UINT ID_RESET     = 2004;
+static const UINT ID_EXIT      = 2005;
+static const UINT ID_RULE_BASE = 3000;
 
 static const wchar_t* APP_TITLE = L"NetVar repeater";
 
@@ -69,8 +79,6 @@ struct Snapshot
 static HINSTANCE g_inst = nullptr;
 static HWND g_window = nullptr;
 static HWND g_popup = nullptr;
-static HWND g_editor = nullptr;
-static HWND g_editCtl = nullptr;
 static HFONT g_uiFont = nullptr;
 static HFONT g_monoFont = nullptr;
 static NOTIFYICONDATAW g_nid;
@@ -78,8 +86,28 @@ static UINT g_msgTaskbarCreated = 0;
 static HICON g_icons[4] = { nullptr, nullptr, nullptr, nullptr };
 static int g_iconState = -1;
 static Snapshot g_snap;
+static int g_failCount = 0;
 static POINT g_anchor = { 0, 0 };
 static bool g_popupVisible = false;
+static bool g_cmdBusy = false;
+static int g_promoTries = 0;
+
+// okna
+static HWND g_editor = nullptr, g_editCtl = nullptr, g_edHelp = nullptr, g_edInfo = nullptr;
+static HWND g_edSave = nullptr, g_edApply = nullptr, g_edNext = nullptr, g_edClose = nullptr;
+static bool g_edDirty = false;
+static std::vector<int> g_edErrLines;
+
+static HWND g_stWin = nullptr, g_stLabel = nullptr, g_stList = nullptr;
+static HWND g_stBtn[4] = { nullptr, nullptr, nullptr, nullptr };
+static std::wstring g_stLabelText;
+static std::vector<std::vector<std::wstring> > g_stCache;
+
+static void OpenEditor();
+static void PopupShow();
+static void OpenStatusWindow();
+static void UpdateStatusWindow();
+static void StartCommand(uint32_t cmd);
 
 // ------------------------------------------------------------
 // Pomocnicze
@@ -94,8 +122,33 @@ static std::wstring W(const std::string& s)
 
 static std::wstring Num(unsigned long long v) { return std::to_wstring(v); }
 
+static std::string WideToUtf8(const std::wstring& w)
+{
+    if (w.empty())
+        return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                        &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::wstring Utf8ToWide(const std::string& s)
+{
+    if (s.empty())
+        return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &w[0], n);
+    return w;
+}
+
 static std::wstring ErrText(DWORD code)
 {
+    if (code == NVR_ERR_NO_RULES)
+        return L"brak poprawnych reguł w konfiguracji";
+
     wchar_t buf[512];
     DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                              nullptr, code, 0, buf, 512, nullptr);
@@ -144,32 +197,76 @@ static std::wstring FormatDuration(uint64_t ft100ns)
     return b;
 }
 
+static std::wstring FormatBytes(uint64_t b)
+{
+    if (b < 1024)
+        return Num(b) + L" B";
+
+    static const wchar_t* units[] = { L"KB", L"MB", L"GB", L"TB" };
+    double v = static_cast<double>(b);
+    int i = -1;
+    do { v /= 1024.0; ++i; } while (v >= 1024.0 && i < 3);
+
+    const unsigned long long whole = static_cast<unsigned long long>(v);
+    const unsigned long long frac = static_cast<unsigned long long>((v - static_cast<double>(whole)) * 10.0);
+    return Num(whole) + L"." + Num(frac) + L" " + units[i];
+}
+
 static std::wstring RuleText(uint32_t src, uint16_t lport, uint32_t dst, uint16_t dport)
 {
     return W(NvrIpToString(src)) + L":" + Num(lport) + L"  ->  " +
            W(NvrIpToString(dst)) + L":" + Num(dport);
 }
 
-static std::string WideToUtf8(const std::wstring& w)
+static std::wstring IfText(const NvrIfInfo& i, bool withIdx)
 {
-    if (w.empty())
-        return std::string();
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
-                                nullptr, 0, nullptr, nullptr);
-    std::string s(static_cast<size_t>(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
-                        &s[0], n, nullptr, nullptr);
+    if (i.ifIdx == 0)
+        return L"-";
+
+    wchar_t nm[40];
+    for (int k = 0; k < 40; ++k)
+        nm[k] = i.name[k];
+    nm[39] = 0;
+
+    std::wstring s = nm[0] ? std::wstring(nm) : std::wstring(L"interfejs");
+    if (i.ip != 0)
+        s += L" (" + W(NvrIpToString(i.ip)) + L")";
+    if (i.flags & NVR_IF_VIRTUAL)
+        s += L" [wirt.]";
+    if (withIdx)
+        s += L" [if " + Num(i.ifIdx) + L"]";
     return s;
 }
 
-static std::wstring Utf8ToWide(const std::string& s)
+static std::wstring TxText(const NvrRuleStatus& r, bool withIdx)
 {
-    if (s.empty())
-        return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring w(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &w[0], n);
-    return w;
+    if (r.outMode == NVR_OUT_OS || r.txShown == 0)
+        return L"wybór systemu";
+
+    std::wstring t;
+    for (uint32_t k = 0; k < r.txShown; ++k)
+    {
+        if (k) t += L", ";
+        t += IfText(r.txIf[k], withIdx);
+    }
+    if (r.outCount > r.txShown)
+        t += L" +" + Num(r.outCount - r.txShown);
+    return t;
+}
+
+static std::wstring StateText(const Snapshot& s)
+{
+    if (!s.ok)
+        return L"USŁUGA NIEDOSTĘPNA";
+    if (s.h.active)
+        return L"AKTYWNY";
+    if (s.h.userStopped)
+        return L"ZATRZYMANY";
+
+    std::wstring t = L"NIE DZIAŁA";
+    if (s.h.retryInSec > 0)
+        t += L" (ponowna próba za " + Num(s.h.retryInSec) + L" s)";
+    return t;
 }
 
 static bool ReadConfigFile(std::string& out)
@@ -190,11 +287,11 @@ static bool ReadConfigFile(std::string& out)
 }
 
 // ------------------------------------------------------------
-// Komunikacja z usluga
+// Komunikacja z usluga (bezpieczna dla watkow)
 // ------------------------------------------------------------
 static bool Transact(uint32_t cmd, Snapshot& out, DWORD timeoutMs)
 {
-    static std::vector<unsigned char> buf(NVR_MAX_REPLY);
+    std::vector<unsigned char> buf(NVR_MAX_REPLY);
 
     NvrRequest req;
     req.magic = NVR_MAGIC;
@@ -229,8 +326,44 @@ static bool Transact(uint32_t cmd, Snapshot& out, DWORD timeoutMs)
     return s.ok;
 }
 
+// Polecenia (Start/Stop/Reset) w osobnym watku - interfejs sie nie blokuje.
+struct CmdJob
+{
+    uint32_t cmd;
+    bool ok;
+    Snapshot snap;
+};
+
+static DWORD WINAPI CmdThread(void* p)
+{
+    CmdJob* j = static_cast<CmdJob*>(p);
+    j->ok = Transact(j->cmd, j->snap, 5000);
+    PostMessageW(g_window, WM_CMD_DONE, 0, reinterpret_cast<LPARAM>(j));
+    return 0;
+}
+
+static void StartCommand(uint32_t cmd)
+{
+    if (g_cmdBusy)
+        return;
+
+    CmdJob* j = new CmdJob();
+    j->cmd = cmd;
+    j->ok = false;
+
+    HANDLE h = CreateThread(nullptr, 0, CmdThread, j, 0, nullptr);
+    if (!h)
+    {
+        delete j;
+        return;
+    }
+
+    g_cmdBusy = true;
+    CloseHandle(h);
+}
+
 // ------------------------------------------------------------
-// Ikony (kolorowe kropki generowane w locie)
+// Ikony - kolorowe tlo z napisem "NV"
 // ------------------------------------------------------------
 static HICON MakeIcon(COLORREF color)
 {
@@ -282,7 +415,7 @@ static HICON MakeIcon(COLORREF color)
     return icon;
 }
 
-// 0 = usluga niedostepna, 1 = zatrzymane, 2 = aktywne, 3 = aktywne z bledami
+// 0 = usluga niedostepna, 1 = zatrzymane / nie dziala, 2 = aktywne, 3 = aktywne z bledami
 static int StateOf(const Snapshot& s)
 {
     if (!s.ok) return 0;
@@ -301,7 +434,7 @@ static void ApplyIconState(bool force)
     g_iconState = st;
     g_nid.hIcon = g_icons[st];
 
-    const wchar_t* tip = st == 0 ? L"NetVar repeater - usluga niedostepna"
+    const wchar_t* tip = st == 0 ? L"NetVar repeater - usługa niedostępna"
                        : st == 1 ? L"NetVar repeater - zatrzymany"
                        :           L"NetVar repeater - aktywny";
     std::wcsncpy(g_nid.szTip, tip, 127);
@@ -325,41 +458,100 @@ static void AddTrayIcon()
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     // Wersja 4: powiadomienia NIN_POPUPOPEN/CLOSE przy najechaniu kursorem
-    // (standardowy, 128-znakowy tooltip jest wtedy wylaczony).
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
 }
 
-// ------------------------------------------------------------
-// Okienko ze statystykami (zamiast tooltipa)
-// ------------------------------------------------------------
-static std::wstring IfText(const NvrIfInfo& i)
+// Windows 11: ikona domyslnie trafia do ukrytych ("przepelnienie").
+// Ustawiamy IsPromoted=1 w HKCU\Control Panel\NotifyIconSettings\<id> (wpis tworzy Explorer
+// po pierwszym dodaniu ikony), co pokazuje ikone na pasku zadan. Zwraca true, gdy nic wiecej
+// nie ma do zrobienia (ustawiono albo klucz nie istnieje - Windows 10).
+static bool PromoteIcon()
 {
-    if (i.ifIdx == 0)
-        return L"(nieznany)";
+    HKEY root = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\NotifyIconSettings", 0,
+                      KEY_ENUMERATE_SUB_KEYS | KEY_READ, &root) != ERROR_SUCCESS)
+        return true;
 
-    wchar_t nm[40];
-    for (int k = 0; k < 40; ++k)
-        nm[k] = i.name[k];
-    nm[39] = 0;
+    static const wchar_t suffix[] = L"\\netvarrepeatertray.exe";
+    const size_t suffixLen = sizeof(suffix) / sizeof(wchar_t) - 1;
 
-    std::wstring s = nm[0] ? std::wstring(nm) : std::wstring(L"interfejs");
-    if (i.ip != 0)
-        s += L" (" + W(NvrIpToString(i.ip)) + L")";
-    s += L" [if " + Num(i.ifIdx) + L"]";
-    return s;
+    bool done = false;
+
+    for (DWORD i = 0; !done; ++i)
+    {
+        wchar_t name[256];
+        DWORD nameLen = 256;
+        if (RegEnumKeyExW(root, i, name, &nameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+            break;
+
+        HKEY sub = nullptr;
+        if (RegOpenKeyExW(root, name, 0, KEY_READ | KEY_SET_VALUE, &sub) != ERROR_SUCCESS)
+            continue;
+
+        wchar_t path[1024];
+        DWORD size = sizeof(path) - sizeof(wchar_t), type = 0;
+        if (RegQueryValueExW(sub, L"ExecutablePath", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(path), &size) == ERROR_SUCCESS && type == REG_SZ)
+        {
+            path[size / sizeof(wchar_t)] = 0;
+            std::wstring p = path;
+            for (size_t k = 0; k < p.size(); ++k)
+                p[k] = static_cast<wchar_t>(std::towlower(p[k]));
+
+            if (p.size() >= suffixLen && p.compare(p.size() - suffixLen, suffixLen, suffix) == 0)
+            {
+                const DWORD one = 1;
+                if (RegSetValueExW(sub, L"IsPromoted", 0, REG_DWORD,
+                                   reinterpret_cast<const BYTE*>(&one), sizeof(one)) == ERROR_SUCCESS)
+                    done = true;
+            }
+        }
+        RegCloseKey(sub);
+    }
+
+    RegCloseKey(root);
+    return done;
 }
 
+// ------------------------------------------------------------
+// Odswiezanie stanu
+// ------------------------------------------------------------
+static void UpdateAllViews()
+{
+    ApplyIconState(false);
+    if (g_popupVisible)
+        PopupShow();
+    UpdateStatusWindow();
+}
+
+static void RefreshStatus(DWORD timeoutMs)
+{
+    Snapshot s;
+    if (Transact(NVR_CMD_STATUS, s, timeoutMs))
+    {
+        g_snap = s;
+        g_failCount = 0;
+    }
+    else if (++g_failCount >= 3)       // chwilowe zacięcia nie zmieniają ikony na szarą
+    {
+        g_snap = Snapshot();
+    }
+
+    UpdateAllViews();
+}
+
+// ------------------------------------------------------------
+// Zwarte okienko przy najechaniu (podwojne buforowanie)
+// ------------------------------------------------------------
 static std::wstring BuildPopupText()
 {
     const Snapshot& s = g_snap;
 
     if (!s.ok)
-        return L"NetVar repeater\r\nUsluga nie odpowiada (zatrzymana lub niezainstalowana).";
+        return L"NetVar repeater\r\nUsługa nie odpowiada (zatrzymana lub niezainstalowana).";
 
-    std::wstring t = L"NetVar repeater - ";
-    t += s.h.active ? L"AKTYWNY" : L"ZATRZYMANY";
-    t += L"\r\n";
+    std::wstring t = L"NetVar repeater - " + StateText(s) + L"\r\n";
 
     if (s.h.startTime != 0)
     {
@@ -370,56 +562,35 @@ static std::wstring BuildPopupText()
     }
 
     if (s.h.lastError != 0)
-        t += L"Ostatni blad: " + ErrText(s.h.lastError) + L"\r\n";
+        t += L"Błąd: " + ErrText(s.h.lastError) + L"\r\n";
 
     if (s.h.configErrorCount != 0)
-        t += L"Bledne linie konfiguracji: " + Num(s.h.configErrorCount) + L" (np. " +
+        t += L"Odrzucone linie konfiguracji: " + Num(s.h.configErrorCount) + L" (" +
              Utf8ToWide(s.h.message) + L")\r\n";
+    else if (!s.h.active && s.h.message[0])
+        t += Utf8ToWide(s.h.message) + L"\r\n";
 
-    t += L"Przechwycone: " + Num(s.h.totalSeen) + L", bez reguly: " + Num(s.h.totalIgnored) + L"\r\n";
+    t += L"Przechwycone: " + Num(s.h.totalSeen) + L"   bez reguły: " + Num(s.h.totalIgnored) +
+         L"   pętla/wirtualne: " + Num(s.h.totalLoopDropped);
 
-    if (s.rules.empty())
-        t += L"\r\n(brak regul)";
-
-    const size_t maxShow = 20;
+    const size_t maxShow = 12;
     for (size_t i = 0; i < s.rules.size() && i < maxShow; ++i)
     {
         const NvrRuleStatus& r = s.rules[i];
 
-        t += L"\r\n#" + Num(i + 1) + L"  " + RuleText(r.srcIp, r.listenPort, r.dstIp, r.dstPort) + L"\r\n";
-        t += L"     odebrane: " + Num(r.received) + L"   przekazane: " + Num(r.forwarded) +
-             L"   bledy wysylania: " + Num(r.errors);
+        t += L"\r\n#" + Num(i + 1) + L"  " + RuleText(r.srcIp, r.listenPort, r.dstIp, r.dstPort) +
+             L"   odebr. " + Num(r.received) + L" (" + FormatBytes(r.bytesReceived) + L")" +
+             L" · przek. " + Num(r.forwarded) + L" (" + FormatBytes(r.bytesForwarded) + L")" +
+             L" · błędy " + Num(r.errors) + L" · pomin. " + Num(r.skipped);
 
-        if (r.errors > 0 && r.lastError != 0)
-            t += L" (" + Num(r.lastError) + L")";
-
-        t += L"\r\n     odbior: ";
-        if (r.rxIf.ifIdx != 0)
-            t += IfText(r.rxIf);
-        else
-            t += L"(jeszcze brak pakietow)";
-
-        t += L"\r\n     wysylanie: ";
-        if (r.outMode == NVR_OUT_OS || r.txShown == 0)
-        {
-            t += L"wybor systemu (trasa domyslna)";
-        }
-        else
-        {
-            for (uint32_t k = 0; k < r.txShown; ++k)
-            {
-                if (k) t += L", ";
-                t += IfText(r.txIf[k]);
-            }
-            if (r.outCount > r.txShown)
-                t += L" +" + Num(r.outCount - r.txShown) + L" wiecej";
-            if (r.outMode == NVR_OUT_BCAST_ALL)
-                t += L"  (bez interfejsu odbiorczego)";
-        }
+        t += L"\r\n      " + (r.rxIf.ifIdx ? IfText(r.rxIf, false) : std::wstring(L"(brak pakietów)")) +
+             L"  →  " + TxText(r, false);
     }
 
+    if (s.rules.empty())
+        t += L"\r\n(brak reguł)";
     if (s.rules.size() > maxShow)
-        t += L"\r\n... i " + Num(s.rules.size() - maxShow) + L" wiecej";
+        t += L"\r\n... i " + Num(s.rules.size() - maxShow) + L" więcej (kliknij ikonę, by zobaczyć wszystkie)";
 
     return t;
 }
@@ -433,19 +604,30 @@ static LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         RECT rc;
         GetClientRect(hwnd, &rc);
 
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_INFOBK));
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, GetSysColor(COLOR_INFOTEXT));
-        HGDIOBJ old = SelectObject(dc, g_uiFont);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ oldBmp = SelectObject(mem, bmp);
+
+        FillRect(mem, &rc, GetSysColorBrush(COLOR_INFOBK));
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, GetSysColor(COLOR_INFOTEXT));
+        HGDIOBJ oldFont = SelectObject(mem, g_uiFont);
 
         RECT tr = { 8, 6, rc.right - 8, rc.bottom - 6 };
         const std::wstring text = BuildPopupText();
-        DrawTextW(dc, text.c_str(), -1, &tr, DT_LEFT | DT_NOPREFIX | DT_EXPANDTABS);
+        DrawTextW(mem, text.c_str(), -1, &tr, DT_LEFT | DT_NOPREFIX | DT_EXPANDTABS);
 
-        SelectObject(dc, old);
+        SelectObject(mem, oldFont);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
         EndPaint(hwnd, &ps);
         return 0;
     }
+
+    if (msg == WM_ERASEBKGND)
+        return 1;
 
     if (msg == WM_NCHITTEST)
         return HTTRANSPARENT;
@@ -462,7 +644,7 @@ static void PopupShow()
 
     HDC dc = GetDC(g_popup);
     HGDIOBJ old = SelectObject(dc, g_uiFont);
-    RECT rc = { 0, 0, 700, 0 };
+    RECT rc = { 0, 0, 900, 0 };
     DrawTextW(dc, text.c_str(), -1, &rc, DT_CALCRECT | DT_LEFT | DT_NOPREFIX | DT_EXPANDTABS);
     SelectObject(dc, old);
     ReleaseDC(g_popup, dc);
@@ -485,7 +667,7 @@ static void PopupShow()
     if (x < wa.left)       x = wa.left;
 
     SetWindowPos(g_popup, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(g_popup, nullptr, TRUE);
+    InvalidateRect(g_popup, nullptr, FALSE);
     g_popupVisible = true;
 }
 
@@ -497,77 +679,238 @@ static void PopupHide()
 }
 
 // ------------------------------------------------------------
-// Polecenia
+// Okno statusu: tabela regul + przyciski
 // ------------------------------------------------------------
-static void RefreshStatus(DWORD timeoutMs)
-{
-    Transact(NVR_CMD_STATUS, g_snap, timeoutMs);
-    ApplyIconState(false);
+static const int ID_ST_START = 5001, ID_ST_STOP = 5002, ID_ST_RESET = 5003, ID_ST_EDIT = 5004;
 
-    if (g_popupVisible)
-        PopupShow();
+struct ColDef { const wchar_t* title; int width; bool right; };
+static const ColDef kCols[] =
+{
+    { L"#",                30,  false }, { L"Nadawca",         100, false }, { L"Port odb.",  65, true },
+    { L"Cel",             110,  false }, { L"Port cel.",        65, true  }, { L"Odebrane",   75, true },
+    { L"Przekazane",       80,  true  }, { L"Błędy",            55, true  }, { L"Pominięte",  70, true },
+    { L"Odebrano (dane)",  95,  true  }, { L"Wysłano (dane)",   95, true  },
+    { L"Karta odbiorcza", 210,  false }, { L"Karta wysyłająca", 280, false }
+};
+static const int NCOLS = sizeof(kCols) / sizeof(kCols[0]);
+
+static std::wstring BuildStatusHeader()
+{
+    const Snapshot& s = g_snap;
+
+    if (!s.ok)
+        return L"Usługa NetVar repeater nie odpowiada (zatrzymana lub niezainstalowana).\r\n"
+               L"Sprawdź services.msc lub uruchom install.bat jako administrator.";
+
+    std::wstring t = L"Stan: " + StateText(s);
+    if (s.h.startTime != 0)
+    {
+        t += L"     Start: " + FormatTime(s.h.startTime);
+        if (s.h.active && s.h.nowTime > s.h.startTime)
+            t += L"     Czas pracy: " + FormatDuration(s.h.nowTime - s.h.startTime);
+    }
+    t += L"\r\nPrzechwycone pakiety: " + Num(s.h.totalSeen) + L"     bez pasującej reguły: " +
+         Num(s.h.totalIgnored) + L"     odrzucone (pętla / karty wirtualne): " + Num(s.h.totalLoopDropped);
+    t += L"\r\nUstawienia: pomijanie kart wirtualnych: " + std::wstring(s.h.excludeVirtual ? L"tak" : L"nie") +
+         L"     limit: " + (s.h.maxPps ? Num(s.h.maxPps) + L" pakietów/s na regułę" : std::wstring(L"brak")) +
+         L"     log: " + Num(s.h.logMaxKb) + L" KB (" + NvrLogPath() + L")";
+
+    if (s.h.lastError != 0)
+        t += L"\r\nBłąd: " + ErrText(s.h.lastError);
+    if (s.h.configErrorCount != 0)
+        t += L"\r\nOdrzucone linie konfiguracji: " + Num(s.h.configErrorCount) + L" (" + Utf8ToWide(s.h.message) + L")";
+    else if (!s.h.active && s.h.message[0])
+        t += L"\r\n" + Utf8ToWide(s.h.message);
+
+    return t;
 }
 
-static void DoCommand(uint32_t cmd)
+static std::vector<std::wstring> RowTexts(size_t i, const NvrRuleStatus& r)
 {
-    HCURSOR oldCursor = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    std::vector<std::wstring> v;
+    v.push_back(Num(i + 1));
+    v.push_back(r.srcIp == 0 ? L"0.0.0.0 (dowolny)" : W(NvrIpToString(r.srcIp)));
+    v.push_back(Num(r.listenPort));
+    v.push_back(W(NvrIpToString(r.dstIp)));
+    v.push_back(Num(r.dstPort));
+    v.push_back(Num(r.received));
+    v.push_back(Num(r.forwarded));
+    v.push_back(Num(r.errors) + ((r.errors > 0 && r.lastError != 0) ? L" (" + Num(r.lastError) + L")" : std::wstring()));
+    v.push_back(Num(r.skipped));
+    v.push_back(FormatBytes(r.bytesReceived));
+    v.push_back(FormatBytes(r.bytesForwarded));
+    v.push_back(r.rxIf.ifIdx ? IfText(r.rxIf, true) : std::wstring(L"(jeszcze brak pakietów)"));
+    v.push_back(TxText(r, true));
+    return v;
+}
 
-    Snapshot s;
-    const bool ok = Transact(cmd, s, 5000);
-    SetCursor(oldCursor);
+static void UpdateStatusWindow()
+{
+    if (!g_stWin)
+        return;
 
-    if (!ok)
+    const std::wstring header = BuildStatusHeader();
+    if (header != g_stLabelText)
     {
-        g_snap = Snapshot();
-        ApplyIconState(false);
-        MessageBoxW(g_window,
-                    L"Usluga NetVarRepeater nie odpowiada.\n"
-                    L"Sprawdz, czy jest zainstalowana i uruchomiona (services.msc).",
-                    APP_TITLE, MB_OK | MB_ICONWARNING);
+        g_stLabelText = header;
+        SetWindowTextW(g_stLabel, header.c_str());
+    }
+
+    const size_t n = g_snap.rules.size();
+    int cnt = ListView_GetItemCount(g_stList);
+
+    while (cnt < static_cast<int>(n))
+    {
+        LVITEM it;
+        std::memset(&it, 0, sizeof(it));
+        it.mask = LVIF_TEXT;
+        it.iItem = cnt;
+        it.pszText = const_cast<LPWSTR>(L"");
+        ListView_InsertItem(g_stList, &it);
+        ++cnt;
+        g_stCache.push_back(std::vector<std::wstring>(NCOLS));
+    }
+    while (cnt > static_cast<int>(n))
+    {
+        ListView_DeleteItem(g_stList, --cnt);
+        g_stCache.pop_back();
+    }
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        const std::vector<std::wstring> row = RowTexts(i, g_snap.rules[i]);
+        for (int c = 0; c < NCOLS; ++c)
+        {
+            if (g_stCache[i][c] != row[c])
+            {
+                g_stCache[i][c] = row[c];
+                ListView_SetItemText(g_stList, static_cast<int>(i), c, const_cast<LPWSTR>(row[c].c_str()));
+            }
+        }
+    }
+
+    const bool avail = g_snap.ok && !g_cmdBusy;
+    EnableWindow(g_stBtn[0], avail);
+    EnableWindow(g_stBtn[1], avail && g_snap.h.active);
+    EnableWindow(g_stBtn[2], avail);
+}
+
+static void LayoutStatus(HWND hwnd)
+{
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const int w = rc.right, h = rc.bottom;
+
+    MoveWindow(g_stLabel, 10, 8, w - 20, 92, TRUE);
+    MoveWindow(g_stList, 8, 104, w - 16, h - 104 - 46, TRUE);
+    MoveWindow(g_stBtn[0], 8, h - 38, 90, 30, TRUE);
+    MoveWindow(g_stBtn[1], 104, h - 38, 90, 30, TRUE);
+    MoveWindow(g_stBtn[2], 200, h - 38, 90, 30, TRUE);
+    MoveWindow(g_stBtn[3], w - 188, h - 38, 180, 30, TRUE);
+}
+
+static LRESULT CALLBACK StatusProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+        case WM_CREATE:
+        {
+            g_stLabel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                0, 0, 0, 0, hwnd, nullptr, g_inst, nullptr);
+
+            g_stList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                0, 0, 0, 0, hwnd, nullptr, g_inst, nullptr);
+            ListView_SetExtendedListViewStyle(g_stList,
+                LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+            for (int c = 0; c < NCOLS; ++c)
+            {
+                LVCOLUMN col;
+                std::memset(&col, 0, sizeof(col));
+                col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+                col.fmt = kCols[c].right ? LVCFMT_RIGHT : LVCFMT_LEFT;
+                col.cx = kCols[c].width;
+                col.pszText = const_cast<LPWSTR>(kCols[c].title);
+                ListView_InsertColumn(g_stList, c, &col);
+            }
+
+            const wchar_t* names[4] = { L"Start", L"Stop", L"Reset", L"Edytuj konfigurację..." };
+            const int ids[4] = { ID_ST_START, ID_ST_STOP, ID_ST_RESET, ID_ST_EDIT };
+            for (int i = 0; i < 4; ++i)
+            {
+                g_stBtn[i] = CreateWindowExW(0, L"BUTTON", names[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                    0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ids[i])), g_inst, nullptr);
+                SendMessageW(g_stBtn[i], WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+            }
+            SendMessageW(g_stLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+            SendMessageW(g_stList, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+            return 0;
+        }
+
+        case WM_SIZE:
+            LayoutStatus(hwnd);
+            return 0;
+
+        case WM_GETMINMAXINFO:
+        {
+            MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+            mmi->ptMinTrackSize.x = 640;
+            mmi->ptMinTrackSize.y = 300;
+            return 0;
+        }
+
+        case WM_COMMAND:
+            switch (LOWORD(wp))
+            {
+                case ID_ST_START: StartCommand(NVR_CMD_START); return 0;
+                case ID_ST_STOP:  StartCommand(NVR_CMD_STOP);  return 0;
+                case ID_ST_RESET: StartCommand(NVR_CMD_RESET); return 0;
+                case ID_ST_EDIT:  OpenEditor();                return 0;
+                case IDCANCEL:    DestroyWindow(hwnd);         return 0;
+            }
+            break;
+
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_DESTROY:
+            g_stWin = nullptr;
+            g_stList = nullptr;
+            g_stLabel = nullptr;
+            g_stLabelText.clear();
+            g_stCache.clear();
+            return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void OpenStatusWindow()
+{
+    if (g_stWin)
+    {
+        ShowWindow(g_stWin, SW_RESTORE);
+        SetForegroundWindow(g_stWin);
         return;
     }
 
-    g_snap = s;
-    ApplyIconState(false);
+    g_stWin = CreateWindowExW(0, L"NvrStatus", L"NetVar repeater - status", WS_OVERLAPPEDWINDOW,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 1060, 420, nullptr, nullptr, g_inst, nullptr);
+    if (!g_stWin)
+        return;
 
-    if (s.cmdResult != NO_ERROR)
-    {
-        std::wstring msg;
-        if (s.cmdResult == ERROR_BAD_CONFIGURATION)
-        {
-            msg = L"Brak poprawnych regul w konfiguracji.";
-            if (s.h.message[0])
-                msg += L"\n" + Utf8ToWide(s.h.message);
-        }
-        else if (s.cmdResult == ERROR_MOD_NOT_FOUND || s.cmdResult == ERROR_FILE_NOT_FOUND)
-        {
-            msg = L"Nie mozna zaladowac WinDivert (brak WinDivert.dll / WinDivert64.sys obok uslugi?).\n" +
-                  ErrText(s.cmdResult);
-        }
-        else if (s.cmdResult == ERROR_ACCESS_DENIED)
-        {
-            msg = L"WinDivert odmowil dostepu - usluga musi dzialac jako SYSTEM / administrator.";
-        }
-        else
-        {
-            msg = L"Polecenie zakonczone bledem: " + ErrText(s.cmdResult);
-        }
-
-        MessageBoxW(g_window, msg.c_str(), APP_TITLE, MB_OK | MB_ICONERROR);
-    }
-    else if (s.h.configErrorCount > 0)
-    {
-        std::wstring msg = L"Konfiguracja wczytana, ale " + Num(s.h.configErrorCount) +
-                           L" linii zostalo odrzuconych.\nPierwszy blad: " + Utf8ToWide(s.h.message);
-        MessageBoxW(g_window, msg.c_str(), APP_TITLE, MB_OK | MB_ICONWARNING);
-    }
+    ShowWindow(g_stWin, SW_SHOW);
+    SetForegroundWindow(g_stWin);
+    RefreshStatus(300);
 }
 
 // ------------------------------------------------------------
 // Edytor konfiguracji
 // ------------------------------------------------------------
-static const int ID_ED_SAVE = 4001, ID_ED_APPLY = 4002, ID_ED_CLOSE = 4003;
-static HWND g_edLabel = nullptr, g_edSave = nullptr, g_edApply = nullptr, g_edClose = nullptr;
+static const int ID_ED_SAVE = 4001, ID_ED_APPLY = 4002, ID_ED_NEXT = 4003, ID_ED_CLOSE = 4004;
+static const UINT_PTR ID_ED_TIMER = 1;
 
 static std::wstring LoadConfigForEditor()
 {
@@ -586,7 +929,6 @@ static std::wstring LoadConfigForEditor()
         w = L"# ip_nadawcy port_odbiorczy ip_docelowy port_docelowy\n";
     }
 
-    // normalizacja konca linii dla kontrolki EDIT
     std::wstring out;
     for (size_t i = 0; i < w.size(); ++i)
     {
@@ -596,22 +938,91 @@ static std::wstring LoadConfigForEditor()
     return out;
 }
 
-static bool SaveConfigFromEditor()
+static std::string EditorTextUtf8()
 {
     const int len = GetWindowTextLengthW(g_editCtl);
     std::wstring w(static_cast<size_t>(len) + 1, L'\0');
     GetWindowTextW(g_editCtl, &w[0], len + 1);
     w.resize(static_cast<size_t>(len));
+    return WideToUtf8(w);
+}
 
-    const std::string utf8 = WideToUtf8(w);
+static NvrConfigResult g_edResult;
+
+static void EditorRevalidate()
+{
+    g_edResult = NvrParseConfig(EditorTextUtf8(), NVR_MAX_RULES);
+    g_edErrLines.clear();
+
+    for (size_t i = 0; i < g_edResult.errors.size(); ++i)
+    {
+        int line = 0;
+        if (std::sscanf(g_edResult.errors[i].c_str(), "linia %d", &line) == 1)
+            g_edErrLines.push_back(line);
+    }
+}
+
+static void EditorUpdateInfo()
+{
+    DWORD start = 0, end = 0;
+    SendMessageW(g_editCtl, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+    const int line = static_cast<int>(SendMessageW(g_editCtl, EM_LINEFROMCHAR, start, 0)) + 1;
+    const int col = static_cast<int>(start) - static_cast<int>(SendMessageW(g_editCtl, EM_LINEINDEX, static_cast<WPARAM>(-1), 0)) + 1;
+
+    std::wstring t = L"Wiersz " + Num(line) + L", kolumna " + Num(col) + L"   |   Reguły: " +
+                     Num(g_edResult.rules.size()) + L"   |   ";
+
+    if (g_edResult.errors.empty())
+        t += L"brak błędów";
+    else
+        t += L"BŁĘDY: " + Num(g_edResult.errors.size()) + L" - " + W(g_edResult.errors[0]);
+
+    wchar_t cur[512];
+    GetWindowTextW(g_edInfo, cur, 512);
+    if (t != cur)
+        SetWindowTextW(g_edInfo, t.c_str());
+
+    EnableWindow(g_edNext, !g_edErrLines.empty());
+}
+
+static void EditorGotoLine(int line1)
+{
+    const LRESULT idx = SendMessageW(g_editCtl, EM_LINEINDEX, static_cast<WPARAM>(line1 - 1), 0);
+    if (idx < 0)
+        return;
+    const LRESULT len = SendMessageW(g_editCtl, EM_LINELENGTH, static_cast<WPARAM>(idx), 0);
+    SendMessageW(g_editCtl, EM_SETSEL, static_cast<WPARAM>(idx), static_cast<LPARAM>(idx + len));
+    SendMessageW(g_editCtl, EM_SCROLLCARET, 0, 0);
+    SetFocus(g_editCtl);
+}
+
+static void EditorNextError()
+{
+    if (g_edErrLines.empty())
+        return;
+
+    DWORD start = 0, end = 0;
+    SendMessageW(g_editCtl, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+    const int cur = static_cast<int>(SendMessageW(g_editCtl, EM_LINEFROMCHAR, start, 0)) + 1;
+
+    int target = g_edErrLines[0];
+    for (size_t i = 0; i < g_edErrLines.size(); ++i)
+        if (g_edErrLines[i] > cur) { target = g_edErrLines[i]; break; }
+
+    EditorGotoLine(target);
+}
+
+static bool SaveConfigFromEditor()
+{
+    const std::string utf8 = EditorTextUtf8();
 
     NvrConfigResult res = NvrParseConfig(utf8, NVR_MAX_RULES);
     if (!res.errors.empty())
     {
-        std::wstring msg = L"W konfiguracji sa bledy (" + Num(res.errors.size()) + L"):\n\n";
+        std::wstring msg = L"W konfiguracji są błędy (" + Num(res.errors.size()) + L"):\n\n";
         for (size_t i = 0; i < res.errors.size() && i < 10; ++i)
             msg += W(res.errors[i]) + L"\n";
-        msg += L"\nBledne linie zostana pominiete przez usluge. Zapisac mimo to?";
+        msg += L"\nBłędne linie zostaną pominięte przez usługę. Zapisać mimo to?";
 
         if (MessageBoxW(g_editor, msg.c_str(), APP_TITLE, MB_YESNO | MB_ICONWARNING) != IDYES)
             return false;
@@ -623,7 +1034,7 @@ static bool SaveConfigFromEditor()
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
     {
-        const std::wstring msg = L"Nie mozna zapisac pliku:\n" + NvrConfigPath() + L"\n" +
+        const std::wstring msg = L"Nie można zapisać pliku:\n" + NvrConfigPath() + L"\n" +
                                  ErrText(GetLastError()) +
                                  L"\n\nUruchom ponownie install.bat (nadaje prawa zapisu) lub edytuj plik jako administrator.";
         MessageBoxW(g_editor, msg.c_str(), APP_TITLE, MB_OK | MB_ICONERROR);
@@ -636,7 +1047,7 @@ static bool SaveConfigFromEditor()
 
     if (!ok || written != utf8.size())
     {
-        MessageBoxW(g_editor, L"Zapis pliku nie powiodl sie.", APP_TITLE, MB_OK | MB_ICONERROR);
+        MessageBoxW(g_editor, L"Zapis pliku nie powiódł się.", APP_TITLE, MB_OK | MB_ICONERROR);
         return false;
     }
 
@@ -650,11 +1061,13 @@ static void LayoutEditor(HWND hwnd)
     GetClientRect(hwnd, &rc);
     const int w = rc.right, h = rc.bottom;
 
-    MoveWindow(g_edLabel, 8, 6, w - 16, 34, TRUE);
-    MoveWindow(g_editCtl, 8, 44, w - 16, h - 44 - 46, TRUE);
-    MoveWindow(g_edSave,  8, h - 38, 110, 30, TRUE);
-    MoveWindow(g_edApply, 126, h - 38, 200, 30, TRUE);
-    MoveWindow(g_edClose, w - 118, h - 38, 110, 30, TRUE);
+    MoveWindow(g_edHelp, 8, 6, w - 16, 50, TRUE);
+    MoveWindow(g_editCtl, 8, 58, w - 16, h - 58 - 28 - 46, TRUE);
+    MoveWindow(g_edInfo, 8, h - 46 - 22, w - 16, 20, TRUE);
+    MoveWindow(g_edSave,  8, h - 38, 100, 30, TRUE);
+    MoveWindow(g_edApply, 114, h - 38, 190, 30, TRUE);
+    MoveWindow(g_edNext,  310, h - 38, 130, 30, TRUE);
+    MoveWindow(g_edClose, w - 108, h - 38, 100, 30, TRUE);
 }
 
 static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -663,32 +1076,42 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         case WM_CREATE:
         {
-            g_edLabel = CreateWindowExW(0, L"STATIC",
-                L"Format linii: ip_nadawcy port_odbiorczy ip_docelowy port_docelowy   "
-                L"(0.0.0.0 = dowolny nadawca, ip docelowy moze byc broadcast, # = komentarz)",
-                WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, nullptr, g_inst, nullptr);
+            g_edHelp = CreateWindowExW(0, L"STATIC",
+                L"Reguła: ip_nadawcy port_odbiorczy ip_docelowy port_docelowy   (0.0.0.0 = dowolny nadawca, "
+                L"ip docelowy może być broadcast, # = komentarz)\r\n"
+                L"Ustawienia: exclude_virtual = yes|no,  max_pps = N (0 = bez limitu),  log_max_kb = N.   "
+                L"Skróty: Ctrl+S zapisz, Ctrl+A zaznacz wszystko, Esc zamknij, Ctrl+Tab do przycisków.",
+                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, hwnd, nullptr, g_inst, nullptr);
 
             g_editCtl = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
-                ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
+                ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | ES_NOHIDESEL,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(6001)), g_inst, nullptr);
+
+            g_edInfo = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
                 0, 0, 0, 0, hwnd, nullptr, g_inst, nullptr);
 
-            g_edSave = CreateWindowExW(0, L"BUTTON", L"Zapisz", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            g_edSave = CreateWindowExW(0, L"BUTTON", L"Zapisz", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ED_SAVE)), g_inst, nullptr);
-            g_edApply = CreateWindowExW(0, L"BUTTON", L"Zapisz i zastosuj (Start)", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            g_edApply = CreateWindowExW(0, L"BUTTON", L"Zapisz i zastosuj (Start)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ED_APPLY)), g_inst, nullptr);
-            g_edClose = CreateWindowExW(0, L"BUTTON", L"Zamknij", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            g_edNext = CreateWindowExW(0, L"BUTTON", L"Następny błąd", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ED_NEXT)), g_inst, nullptr);
+            g_edClose = CreateWindowExW(0, L"BUTTON", L"Zamknij", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ED_CLOSE)), g_inst, nullptr);
 
-            SendMessageW(g_edLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+            HWND all[] = { g_edHelp, g_edInfo, g_edSave, g_edApply, g_edNext, g_edClose };
+            for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); ++i)
+                SendMessageW(all[i], WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
             SendMessageW(g_editCtl, WM_SETFONT, reinterpret_cast<WPARAM>(g_monoFont), TRUE);
-            SendMessageW(g_edSave, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
-            SendMessageW(g_edApply, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
-            SendMessageW(g_edClose, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
 
             SendMessageW(g_editCtl, EM_SETLIMITTEXT, 1024 * 1024, 0);
             SetWindowTextW(g_editCtl, LoadConfigForEditor().c_str());
             SendMessageW(g_editCtl, EM_SETMODIFY, FALSE, 0);
+
+            EditorRevalidate();
+            EditorUpdateInfo();
+            SetTimer(hwnd, ID_ED_TIMER, 300, nullptr);
             return 0;
         }
 
@@ -696,11 +1119,38 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             LayoutEditor(hwnd);
             return 0;
 
+        case WM_GETMINMAXINFO:
+        {
+            MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+            mmi->ptMinTrackSize.x = 560;
+            mmi->ptMinTrackSize.y = 320;
+            return 0;
+        }
+
         case WM_SETFOCUS:
             SetFocus(g_editCtl);
             return 0;
 
+        case WM_TIMER:
+            if (wp == ID_ED_TIMER)
+            {
+                if (g_edDirty)
+                {
+                    g_edDirty = false;
+                    EditorRevalidate();
+                }
+                EditorUpdateInfo();
+            }
+            return 0;
+
         case WM_COMMAND:
+            if (lp != 0 && reinterpret_cast<HWND>(lp) == g_editCtl)
+            {
+                if (HIWORD(wp) == EN_CHANGE)
+                    g_edDirty = true;
+                return 0;
+            }
+
             switch (LOWORD(wp))
             {
                 case ID_ED_SAVE:
@@ -709,10 +1159,16 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
                 case ID_ED_APPLY:
                     if (SaveConfigFromEditor())
-                        DoCommand(NVR_CMD_START);
+                        StartCommand(NVR_CMD_START);
+                    return 0;
+
+                case ID_ED_NEXT:
+                    EditorRevalidate();
+                    EditorNextError();
                     return 0;
 
                 case ID_ED_CLOSE:
+                case IDCANCEL:
                     SendMessageW(hwnd, WM_CLOSE, 0, 0);
                     return 0;
             }
@@ -721,7 +1177,7 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_CLOSE:
             if (SendMessageW(g_editCtl, EM_GETMODIFY, 0, 0))
             {
-                const int r = MessageBoxW(hwnd, L"Zapisac zmiany w konfiguracji?", APP_TITLE,
+                const int r = MessageBoxW(hwnd, L"Zapisać zmiany w konfiguracji?", APP_TITLE,
                                           MB_YESNOCANCEL | MB_ICONQUESTION);
                 if (r == IDCANCEL)
                     return 0;
@@ -732,6 +1188,7 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
 
         case WM_DESTROY:
+            KillTimer(hwnd, ID_ED_TIMER);
             g_editor = nullptr;
             g_editCtl = nullptr;
             return 0;
@@ -750,13 +1207,65 @@ static void OpenEditor()
     }
 
     g_editor = CreateWindowExW(0, L"NvrEditor", L"NetVar repeater - konfiguracja",
-                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
+                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 520,
                                nullptr, nullptr, g_inst, nullptr);
     if (g_editor)
     {
         ShowWindow(g_editor, SW_SHOW);
         SetForegroundWindow(g_editor);
     }
+}
+
+// Skroty klawiszowe okien edytora i statusu (wolane z petli komunikatow).
+static bool HandleKeys(MSG& m)
+{
+    if (g_editor && (m.hwnd == g_editor || IsChild(g_editor, m.hwnd)))
+    {
+        if (m.message == WM_KEYDOWN)
+        {
+            const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+
+            if (m.wParam == VK_ESCAPE)
+            {
+                PostMessageW(g_editor, WM_CLOSE, 0, 0);
+                return true;
+            }
+            if (ctrl && m.wParam == 'S')
+            {
+                PostMessageW(g_editor, WM_COMMAND, ID_ED_SAVE, 0);
+                return true;
+            }
+            if (m.hwnd == g_editCtl && ctrl)
+            {
+                if (m.wParam == 'A')
+                {
+                    SendMessageW(g_editCtl, EM_SETSEL, 0, static_cast<LPARAM>(-1));
+                    return true;
+                }
+                if (m.wParam == VK_TAB)
+                {
+                    SetFocus(g_edSave);
+                    return true;
+                }
+            }
+        }
+
+        if (m.hwnd != g_editCtl && IsDialogMessageW(g_editor, &m))
+            return true;
+    }
+
+    if (g_stWin && (m.hwnd == g_stWin || IsChild(g_stWin, m.hwnd)))
+    {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE)
+        {
+            DestroyWindow(g_stWin);
+            return true;
+        }
+        if (IsDialogMessageW(g_stWin, &m))
+            return true;
+    }
+
+    return false;
 }
 
 // ------------------------------------------------------------
@@ -771,21 +1280,19 @@ static void ShowMenu(POINT pt)
     if (!menu)
         return;
 
-    const bool avail = g_snap.ok;
-    const bool active = avail && g_snap.h.active;
+    const bool avail = g_snap.ok && !g_cmdBusy;
+    const bool active = g_snap.ok && g_snap.h.active;
 
-    const wchar_t* state = !avail ? L"Stan: usluga niedostepna"
-                         : active ? L"Stan: AKTYWNY" : L"Stan: ZATRZYMANY";
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, state);
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, (L"Stan: " + StateText(g_snap)).c_str());
+    AppendMenuW(menu, MF_STRING, ID_STATUSWIN, L"Pokaż status...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
-    // Konfiguracja (z pliku) - klikniecie otwiera edytor
     std::string raw;
     NvrConfigResult cfg;
     if (ReadConfigFile(raw))
         cfg = NvrParseConfig(raw, NVR_MAX_RULES);
 
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Konfiguracja (kliknij, aby edytowac):");
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Konfiguracja (kliknij, aby edytować):");
 
     for (size_t i = 0; i < cfg.rules.size() && i < 25; ++i)
     {
@@ -795,30 +1302,88 @@ static void ShowMenu(POINT pt)
     }
 
     if (cfg.rules.empty())
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"   (brak regul)");
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"   (brak reguł)");
     else if (cfg.rules.size() > 25)
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
-                    (L"   ... i " + Num(cfg.rules.size() - 25) + L" wiecej").c_str());
+                    (L"   ... i " + Num(cfg.rules.size() - 25) + L" więcej").c_str());
 
     if (!cfg.errors.empty())
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
-                    (L"   bledne linie: " + Num(cfg.errors.size())).c_str());
+                    (L"   błędne linie: " + Num(cfg.errors.size())).c_str());
 
-    AppendMenuW(menu, MF_STRING, ID_EDIT, L"Edytuj konfiguracje...");
+    AppendMenuW(menu, MF_STRING, ID_EDIT, L"Edytuj konfigurację...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
-    AppendMenuW(menu, MF_STRING | (avail ? 0 : MF_GRAYED), ID_START,
-                L"Start (wczytaj konfiguracje)");
-    AppendMenuW(menu, MF_STRING | (active ? 0 : MF_GRAYED), ID_STOP, L"Stop");
-    AppendMenuW(menu, MF_STRING | (avail ? 0 : MF_GRAYED), ID_RESET,
-                L"Reset (wczytaj konfiguracje i zeruj liczniki)");
+    AppendMenuW(menu, MF_STRING | (avail ? 0 : MF_GRAYED), ID_START, L"Start (wczytaj konfigurację)");
+    AppendMenuW(menu, MF_STRING | ((avail && active) ? 0 : MF_GRAYED), ID_STOP, L"Stop");
+    AppendMenuW(menu, MF_STRING | (avail ? 0 : MF_GRAYED), ID_RESET, L"Reset (wczytaj konfigurację i zeruj liczniki)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, ID_EXIT, L"Zamknij ikone");
+    AppendMenuW(menu, MF_STRING, ID_EXIT, L"Zamknij ikonę");
 
     SetForegroundWindow(g_window);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, g_window, nullptr);
     PostMessageW(g_window, WM_NULL, 0, 0);
     DestroyMenu(menu);
+}
+
+// ------------------------------------------------------------
+// Wynik polecenia (w watku interfejsu)
+// ------------------------------------------------------------
+static void OnCommandDone(CmdJob* j)
+{
+    g_cmdBusy = false;
+
+    if (!j->ok)
+    {
+        g_snap = Snapshot();
+        UpdateAllViews();
+        MessageBoxW(g_window,
+                    L"Usługa NetVar repeater nie odpowiada.\n"
+                    L"Sprawdź, czy jest zainstalowana i uruchomiona (services.msc).",
+                    APP_TITLE, MB_OK | MB_ICONWARNING);
+        delete j;
+        return;
+    }
+
+    g_snap = j->snap;
+    g_failCount = 0;
+    UpdateAllViews();
+
+    const DWORD res = j->snap.cmdResult;
+
+    if (res != NO_ERROR)
+    {
+        std::wstring msg;
+        if (res == NVR_ERR_NO_RULES)
+        {
+            msg = L"Brak poprawnych reguł w konfiguracji.";
+            if (j->snap.h.message[0])
+                msg += L"\n" + Utf8ToWide(j->snap.h.message);
+            msg += L"\n\nUsługa spróbuje ponownie automatycznie po poprawieniu konfiguracji.";
+        }
+        else if (res == ERROR_MOD_NOT_FOUND || res == ERROR_FILE_NOT_FOUND || res == ERROR_PATH_NOT_FOUND)
+        {
+            msg = L"Nie można załadować WinDivert (brak WinDivert.dll / WinDivert64.sys obok usługi?).\n" + ErrText(res);
+        }
+        else if (res == ERROR_ACCESS_DENIED)
+        {
+            msg = L"WinDivert odmówił dostępu - usługa musi działać jako SYSTEM / administrator.";
+        }
+        else
+        {
+            msg = L"Polecenie zakończone błędem: " + ErrText(res) + L"\nSzczegóły: " + NvrLogPath();
+        }
+
+        MessageBoxW(g_window, msg.c_str(), APP_TITLE, MB_OK | MB_ICONERROR);
+    }
+    else if (j->snap.h.configErrorCount > 0)
+    {
+        const std::wstring msg = L"Konfiguracja wczytana, ale " + Num(j->snap.h.configErrorCount) +
+                                 L" linii zostało odrzuconych.\nPierwszy błąd: " + Utf8ToWide(j->snap.h.message);
+        MessageBoxW(g_window, msg.c_str(), APP_TITLE, MB_OK | MB_ICONWARNING);
+    }
+
+    delete j;
 }
 
 // ------------------------------------------------------------
@@ -830,6 +1395,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         AddTrayIcon();
         ApplyIconState(true);
+        g_promoTries = 0;
+        SetTimer(hwnd, ID_PROMO, 3000, nullptr);
         return 0;
     }
 
@@ -841,11 +1408,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             RefreshStatus(300);
             ApplyIconState(true);
             SetTimer(hwnd, ID_TIMER, 2000, nullptr);
+            SetTimer(hwnd, ID_PROMO, 3000, nullptr);
             return 0;
 
         case WM_TIMER:
             if (wp == ID_TIMER)
+            {
                 RefreshStatus(300);
+            }
+            else if (wp == ID_PROMO)
+            {
+                if (PromoteIcon() || ++g_promoTries >= 8)
+                    KillTimer(hwnd, ID_PROMO);
+            }
+            return 0;
+
+        case WM_CMD_DONE:
+            OnCommandDone(reinterpret_cast<CmdJob*>(lp));
             return 0;
 
         case WM_TRAY:
@@ -865,13 +1444,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     PopupHide();
                     break;
 
-                case WM_CONTEXTMENU:
-                case WM_RBUTTONUP:
-                    ShowMenu(pt);
+                case NIN_SELECT:
+                case NIN_KEYSELECT:
+                    PopupHide();
+                    OpenStatusWindow();
                     break;
 
-                case WM_LBUTTONDBLCLK:
-                    OpenEditor();
+                case WM_CONTEXTMENU:        // tylko to zdarzenie - bez WM_RBUTTONUP (podwojne menu)
+                    ShowMenu(pt);
                     break;
             }
             return 0;
@@ -889,20 +1469,24 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             switch (id)
             {
-                case ID_EDIT:  OpenEditor(); return 0;
-                case ID_START: DoCommand(NVR_CMD_START); return 0;
-                case ID_STOP:  DoCommand(NVR_CMD_STOP);  return 0;
-                case ID_RESET: DoCommand(NVR_CMD_RESET); return 0;
-                case ID_EXIT:  DestroyWindow(hwnd);      return 0;
+                case ID_STATUSWIN: OpenStatusWindow();         return 0;
+                case ID_EDIT:      OpenEditor();               return 0;
+                case ID_START:     StartCommand(NVR_CMD_START); return 0;
+                case ID_STOP:      StartCommand(NVR_CMD_STOP);  return 0;
+                case ID_RESET:     StartCommand(NVR_CMD_RESET); return 0;
+                case ID_EXIT:      DestroyWindow(hwnd);        return 0;
             }
             break;
         }
 
         case WM_DESTROY:
             KillTimer(hwnd, ID_TIMER);
+            KillTimer(hwnd, ID_PROMO);
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             if (g_editor)
                 DestroyWindow(g_editor);
+            if (g_stWin)
+                DestroyWindow(g_stWin);
             PostQuitMessage(0);
             return 0;
     }
@@ -919,6 +1503,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     if (GetLastError() == ERROR_ALREADY_EXISTS)
         return 0;
 
+    INITCOMMONCONTROLSEX icc;
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&icc);
+
     NONCLIENTMETRICSW ncm;
     std::memset(&ncm, 0, sizeof(ncm));
     ncm.cbSize = sizeof(ncm);
@@ -929,7 +1518,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
                              FIXED_PITCH | FF_MODERN, L"Consolas");
 
     g_icons[0] = MakeIcon(RGB(110, 110, 110));   // niedostepna
-    g_icons[1] = MakeIcon(RGB(200, 115, 0));    // zatrzymana
+    g_icons[1] = MakeIcon(RGB(200, 115, 0));     // zatrzymana / nie dziala
     g_icons[2] = MakeIcon(RGB(25, 135, 50));     // aktywna
     g_icons[3] = MakeIcon(RGB(190, 30, 30));     // aktywna z bledami
 
@@ -951,9 +1540,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     RegisterClassW(&wc);
 
     wc.style = 0;
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(static_cast<INT_PTR>(COLOR_BTNFACE + 1));
+
     wc.lpfnWndProc = EditorProc;
     wc.lpszClassName = L"NvrEditor";
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    RegisterClassW(&wc);
+
+    wc.lpfnWndProc = StatusProc;
+    wc.lpszClassName = L"NvrStatus";
     RegisterClassW(&wc);
 
     g_popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
@@ -968,6 +1562,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0)
     {
+        if (HandleKeys(m))
+            continue;
+
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
