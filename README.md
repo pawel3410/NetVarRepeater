@@ -1,122 +1,126 @@
-# NetVarRepeater
+# NetVar repeater
 
 Program dla Windows 10/11 (x64), który **kopiuje odebrane datagramy UDP** z wybranego portu odbiorczego i **wysyła ich zawartość** pod inny adres IP i port (także broadcast). Działa jako usługa startująca z systemem; ikona w zasobniku (systray) służy do podglądu statystyk i sterowania.
 
-## Spis plików
+## Pliki projektu (wszystkie w jednym katalogu)
 
 | Plik | Rola |
 |---|---|
-| `service.cpp` | Usługa Windows: przechwytywanie (WinDivert), przekazywanie, liczniki, serwer named pipe |
-| `tray.cpp` | Ikona w zasobniku: okno statystyk przy najechaniu, menu, edytor konfiguracji |
-| `common.h` | Protokół usługa ↔ tray (struktury, polecenia), ścieżka konfiguracji |
-| `config.h` | Parser pliku konfiguracji (wspólny dla usługi i tray) |
-| `NetVarRepeater.cbp` | Projekt Code::Blocks (targety `Service`, `Tray`, `ServiceDebug`) |
+| `service.cpp` | Usługa Windows: przechwytywanie (WinDivert), przekazywanie, liczniki, log, nadzór, serwer named pipe; tryb konsolowy `--console` |
+| `tray.cpp` | Ikona w zasobniku: okienko przy najechaniu, okno statusu, menu, edytor konfiguracji |
+| `common.h` | Protokół usługa ↔ tray, ścieżki plików |
+| `config.h` | Parser `config.txt` (reguły i ustawienia) |
+| `NetVarRepeater.cbp` | Projekt Code::Blocks (targety `Service`, `Tray`) – wyniki i pliki `.o` trafiają do tego samego katalogu |
 | `install.bat` / `uninstall.bat` | Instalacja / usunięcie usługi i autostartu ikony |
+| `README.md` | Ta dokumentacja |
+
+Po kompilacji w tym samym katalogu powstają `NetVarRepeaterService.exe` i `NetVarRepeaterTray.exe`; dokładasz do niego `WinDivert.dll` i `WinDivert64.sys`.
 
 ## Funkcje
 
-- Przekazywanie UDP: `ip_nadawcy + port odbiorczy → ip docelowy + port docelowy`, dowolna liczba reguł (limit 256).
-- Jeden pakiet może pasować do wielu reguł (np. port 1202 → dwa różne cele) – każda reguła ma własne liczniki.
-- `ip_nadawcy = 0.0.0.0` oznacza **dowolnego nadawcę** (także pakiet broadcast i pakiet z adresem źródłowym 0.0.0.0).
-- Adres docelowy może być broadcastem ograniczonym (`255.255.255.255`) lub kierowanym (np. `192.168.1.255`).
-- **Port nasłuchu nie jest blokowany**: WinDivert pracuje w trybie `SNIFF` (kopia pakietu), a program nigdy nie wykonuje `bind()` na porcie odbiorczym. Oryginalny pakiet trafia normalnie do innych programów.
-- Usługa startuje automatycznie z systemem (`start= auto`, konto SYSTEM) i od razu zaczyna przekazywać pakiety; restartuje się po awarii.
-- **Najechanie na ikonę**: okno z informacją o stanie, czasie rozpoczęcia, czasie działania oraz – dla każdej reguły – liczbą pakietów odebranych, przekazanych i błędów wysyłania (plus wybrany interfejs wyjściowy).
-- Dla każdej reguły okno pokazuje też **kartę odbierającą** i **karty wysyłające**: nazwę, adres IPv4 i indeks interfejsu (np. `Ethernet 2 (192.168.1.5) [if 12]`).
-- **Prawy przycisk** – menu:
-  - lista reguł z pliku konfiguracji (kliknięcie otwiera edytor), `Edytuj konfigurację...`,
-  - **Start** – wczytuje konfigurację ponownie i (re)startuje przekazywanie (liczniki niezmienionych reguł są zachowane),
-  - **Stop** – zatrzymuje przekazywanie (usługa działa dalej),
-  - **Reset** – wczytuje konfigurację, zeruje liczniki i czas startu (stan Start/Stop pozostaje bez zmian),
-  - `Zamknij ikonę`.
-- Ikona ma napis „NV” (na ikonie 16×16 nie zmieści się pełna nazwa); pełne „NetVar repeater” jest w tooltipie, oknie statystyk i tytułach okien.
-- Kolor ikony: szary – usługa niedostępna, pomarańczowy – zatrzymany, zielony – aktywny, czerwony – aktywny, ale wystąpiły błędy wysyłania.
-- Podwójne kliknięcie ikony otwiera edytor konfiguracji.
+- Reguły UDP: `ip_nadawcy + port odbiorczy → ip docelowy + port docelowy`, do 256 reguł; jeden pakiet może pasować do wielu reguł (każda ma własne liczniki).
+- `ip_nadawcy = 0.0.0.0` = **dowolny nadawca** (także broadcast). Cel może być broadcastem ograniczonym (`255.255.255.255`) lub kierowanym (np. `192.168.1.255`).
+- **Port nie jest blokowany**: WinDivert w trybie `SNIFF` (kopia pakietu), brak `bind()` na porcie odbiorczym.
+- Automatyczny start z systemem; **ponawianie startu po błędzie** (WinDivert niezaładowany, brak reguł, brak sieci...) z narastającym odstępem 5 → 10 → 20 → 30 → 60 s. Nie dotyczy stanu „zatrzymany przez użytkownika”. Usługa restartuje się też po awarii procesu (ustawienia SCM).
+- **Pomijanie kart wirtualnych** (domyślnie włączone, `exclude_virtual = yes`): VMware, VirtualBox, Hyper-V/vEthernet, WSL, Docker, VPN/TAP/WireGuard/Tailscale/ZeroTier, Bluetooth PAN, tunele (Teredo, ISATAP, 6to4) i każda karta o typie innym niż Ethernet/Wi-Fi/WWAN. Rozpoznanie: typ interfejsu, prefiks MAC (VMware, VirtualBox, Hyper-V, Parallels, Xen, QEMU) oraz nazwa/opis. Pominięte karty nie są używane do wysyłania ani odbioru.
+- **Log** `C:\ProgramData\NetVarRepeater\netvarrepeater.log` z rotacją: po przekroczeniu `log_max_kb` plik jest przenoszony do `.log.1` (nadpisując poprzedni), więc zajęcie dysku to najwyżej ok. 2 × `log_max_kb`. Zapisywane są: start/stop, konfiguracja i odrzucone linie, lista kart i wybrane wyjścia, błędy WinDivert i wysyłki (ograniczone do 1 wpisu/min na regułę), ostrzeżenia o limicie pakietów.
+- **Ochrona przed pętlą**: (1) odrzucanie pakietów, których nadawcą jest własny adres, (2) filtr `loopback == 0` i tylko ruch przychodzący, (3) brak odsyłania broadcastu na kartę odbiorczą, (4) pominięcie broadcastu kierowanego na tę samą sieć i ten sam port (ping-pong z drugim repeaterem), (5) limit `max_pps` pakietów/s na regułę (domyślnie 2000, `0` = bez limitu).
+- **Tryb konsolowy**: `NetVarRepeaterService.exe --console` – ten sam kod w oknie konsoli, log na ekranie, Ctrl+C kończy. Wymaga administratora; odmawia startu, gdy zainstalowana usługa już działa. Target `Service` w Code::Blocks ma ten parametr ustawiony.
+
+### Ikona, okienka i menu
+
+- Ikona ma napis „NV” (na 16×16 pełna nazwa się nie mieści), pełne „NetVar repeater” jest w tooltipie i tytułach okien. Kolor: szary – usługa niedostępna, pomarańczowy – zatrzymany / nie działa, zielony – aktywny, czerwony – aktywny z błędami wysyłania.
+- **Najechanie**: zwarte okienko – stan, start, czas pracy, błędy, liczniki ogólne i po dwie linie na regułę (liczniki + karta odbiorcza → karty wysyłające z adresami IP).
+- **Kliknięcie ikony**: okno statusu (tabela wszystkich reguł: odebrane, przekazane, błędy, pominięte, dane odebrane/wysłane, karta odbiorcza i wysyłająca z IP i indeksem) z przyciskami Start/Stop/Reset/Edytuj. Odświeża się co 2 s bez migotania.
+- **Prawy przycisk**: status, lista reguł (kliknięcie otwiera edytor), `Edytuj konfigurację...`, **Start** (wczytuje konfigurację), **Stop**, **Reset** (wczytuje konfigurację i zeruje liczniki; stan Start/Stop bez zmian), `Zamknij ikonę`.
+- Polecenia wykonują się w tle – okna się nie blokują, a status jest dostępny także podczas Start/Reset (usługa obsługuje pipe w 3 wątkach). Chwilowe braki odpowiedzi nie zmieniają ikony na szarą (dopiero 3 kolejne).
+- **Edytor konfiguracji**: Ctrl+A, Ctrl+S, Esc, Ctrl+Tab (do przycisków), na bieżąco liczy reguły i błędy, pokazuje wiersz/kolumnę, przycisk *Następny błąd* skacze do błędnej linii, pyta o zapis przy zamykaniu. *Zapisz i zastosuj* zapisuje i wysyła Start.
+- **Ikona nie ma trafiać do ukrytych**: Windows 11 domyślnie chowa nowe ikony. Tray ustawia w `HKCU\Control Panel\NotifyIconSettings\<id>` wartość `IsPromoted = 1` dla własnego pliku exe (kilka prób po starcie, bo wpis tworzy Explorer). To mechanizm nieudokumentowany przez Microsoft – na Windows 10 klucz nie istnieje i ikona jest widoczna, jeśli użytkownik jej sam nie ukryje. Jeśli ręcznie przeniesiesz ikonę do ukrytych, przy następnym starcie tray zostanie przypięta ponownie.
 
 ## Konfiguracja
 
-Plik: `C:\ProgramData\NetVarRepeater\config.txt` (tworzony z komentowanym przykładem przy pierwszym starcie).
+Plik: `C:\ProgramData\NetVarRepeater\config.txt` (tworzony z komentowanym przykładem przy pierwszym starcie; zapisany w UTF-8).
 
 ```
-# ip_nadawcy  port_odbiorczy  ip_docelowy  port_docelowy
+# ustawienia
+exclude_virtual = yes
+max_pps = 2000
+log_max_kb = 512
+
+# reguły: ip_nadawcy port_odbiorczy ip_docelowy port_docelowy
 0.0.0.0    1202  192.168.1.10     1203
 10.0.0.1   1203  192.170.10.3     1203
 0.0.0.0    1202  192.170.10.4     1202
 10.0.0.1   1203  255.255.255.255  1203
 ```
 
-- Separatory: spacje, tabulatory lub przecinki. Komentarze: `#` lub `;`.
-- Błędne linie (zły adres, port spoza 1–65535, nie 4 pola, duplikat) są pomijane; ich liczba i pierwszy komunikat są widoczne w oknie statystyk i po Start/Reset.
-- Edycja: menu ikony → `Edytuj konfigurację...` (przyciski *Zapisz* i *Zapisz i zastosuj*) albo dowolny edytor. Zmiany działają po **Start** lub **Reset**.
+- Separatory reguł: spacje, tabulatory lub przecinki. Komentarze: `#` lub `;`. Ustawienia: `klucz = wartość` (`exclude_virtual`: yes/no/tak/nie/true/false/1/0; `max_pps`: 0–1000000; `log_max_kb`: 16–102400).
+- Błędne linie (zły adres/port, nie 4 pola, duplikat, nieznane ustawienie) są pomijane i widoczne w statusie, edytorze i logu. Brak poprawnych reguł = usługa nie przekazuje i ponawia próbę (można poprawić plik bez klikania Start).
+- Zmiany działają po **Start** lub **Reset** (albo po automatycznym ponowieniu startu).
+
+## Liczniki
+
+Na regułę obowiązuje zależność **odebrane = przekazane + błędy + pominięte**:
+
+- *odebrane* – pakiety dopasowane do reguły,
+- *przekazane* – wysłane poprawnie na wszystkie wyjścia,
+- *błędy* – wysyłka nie powiodła się choć na jednym wyjściu lub nie ma żadnego wyjścia (w nawiasie kod ostatniego błędu),
+- *pominięte* – celowo nie wysłane (limit `max_pps`, ochrona przed pętlą),
+- *dane odebrane/wysłane* – suma bajtów payloadu; wysłane liczone po każdym wyjściu, więc broadcast na dwie karty daje dwukrotność.
+
+Liczniki ogólne: *przechwycone* (przez filtr WinDivert), *bez reguły* (uszkodzone, sfragmentowane, bez pasującej reguły), *pętla/wirtualne* (pakiety z własnego adresu i z kart wirtualnych).
 
 ## Identyfikacja interfejsów sieciowych
 
-W konfiguracji nie podaje się interfejsów, więc program wyznacza je sam, osobno dla strony odbiorczej i wyjściowej.
+**Odbiór.** WinDivert (warstwa `NETWORK`, `SNIFF`) obejmuje wszystkie interfejsy; filtr: `inbound and loopback == 0 and ip and udp and (udp.DstPort == P1 or ...)`. Każdy pakiet ma indeks interfejsu odbiorczego (`IfIdx`), który program zapisuje w regule i dopasowuje do listy kart (nazwa, IP, flaga wirtualna). Pakiety są widziane przed zaporą, więc port nie musi być otwarty. Nadawca i port są dopasowywane w kodzie.
 
-**Odbiór (skąd przyszedł pakiet).**
-- WinDivert (warstwa `NETWORK`, `SNIFF`) obejmuje wszystkie interfejsy naraz. Filtr: `inbound and loopback == 0 and ip and udp and (udp.DstPort == P1 or ...)` – porty pochodzą z reguł.
-- Do każdego pakietu WinDivert dołącza strukturę adresu z **indeksem interfejsu odbiorczego (`IfIdx`)**. Program zapisuje go dla pakietu i używa przy broadcastach (patrz niżej).
-- Pakiety są widziane na warstwie sieciowej, zanim zdecyduje o nich firewall – port nie musi być otwarty ani nasłuchiwany przez żaden program.
-- Nadawca (`ip.SrcAddr`) i port są dopasowywane do reguł w kodzie, nie w filtrze (filtr WinDivert ma ograniczoną długość).
-- `loopback == 0` + filtr tylko na ruch przychodzący zapobiega pętli: pakiety wysłane przez sam program nie są ponownie przechwytywane.
-
-**Wyjście (którędy wysłać).** Przy starcie, a potem co 30 s i po błędzie wysyłki program wylicza interfejsy (`GetAdaptersAddresses`: tylko IPv4, stan *Up*, bez loopbacku, z długością prefiksu) i dla każdej reguły wybiera tryb:
+**Wyjście.** Lista kart (`GetAdaptersAddresses`: IPv4, stan *Up*, bez loopbacku, z prefiksem i flagą wirtualna) jest sprawdzana co 5 s i po błędzie wysyłki. **Gniazda są odtwarzane tylko wtedy, gdy lista kart faktycznie się zmieniła** (albo gdy dana reguła miała błąd wysyłki), więc port źródłowy nie zmienia się bez potrzeby. Tryb wyjścia na regułę:
 
 | Adres docelowy | Wybór |
 |---|---|
-| `255.255.255.255` | po jednym gnieździe na każdy aktywny interfejs, **z pominięciem interfejsu, na którym pakiet odebrano** (przekazanie „na inny interfejs”, brak odbicia na tę samą sieć) |
-| broadcast kierowany, np. `192.168.1.255` | interfejs, którego podsieć ma ten adres rozgłoszeniowy |
-| zwykły unicast | interfejs wskazany przez tablicę routingu (`GetBestInterfaceEx`) |
-| brak dopasowania (np. adres lokalny) | wybiera system |
+| `255.255.255.255` | po jednym gnieździe na każdą aktywną, niewykluczoną kartę, **bez karty odbiorczej** |
+| broadcast kierowany, np. `192.168.1.255` | karta z tą podsiecią |
+| unicast | karta z tablicy routingu (`GetBestInterfaceEx`) |
+| inne (adres lokalny, karta wykluczona) | wybiera system |
 
-Gniazdo wyjściowe jest **przypięte do interfejsu** dwoma mechanizmami naraz: `bind()` na adres IP interfejsu (poprawny adres źródłowy) oraz `IP_UNICAST_IF` (wymuszenie interfejsu także dla broadcastu, gdzie sama trasa byłaby niejednoznaczna). Włączone jest `SO_BROADCAST`. Wybrany tryb, nazwa karty, jej adres IP i indeks interfejsu (odbiorczego i wysyłających) widać w oknie statystyk. Karta odbiorcza jest zapamiętywana z ostatniego pakietu danej reguły, więc do czasu pierwszego pakietu widnieje „jeszcze brak pakietów”. Przy broadcast `255.255.255.255` raportowanych jest do 4 kart wysyłających.
-
-Przekazywana jest **zawartość datagramu (payload)** w nowym pakiecie UDP – adres i port źródłowy są inne niż w oryginale (źródło = adres interfejsu wyjściowego, port efemeryczny).
+Gniazdo jest przypięte do karty przez `bind()` na jej adres oraz `IP_UNICAST_IF` (działa też dla broadcastu); `SO_BROADCAST` włączone. Przekazywana jest zawartość datagramu w nowym pakiecie – adres źródłowy to adres karty wyjściowej, port efemeryczny.
 
 ## Kompilacja (Code::Blocks + MinGW-w64, 64 bity)
 
-1. Otwórz `NetVarRepeater.cbp`, kompilator **GNU GCC (MinGW-w64, x86_64)**, najlepiej GCC ≥ 8 (wątki *posix* lub *win32* – oba działają).
-2. Zbuduj targety **Service** i **Tray** (Release). Wyniki: `bin/NetVarRepeaterService.exe`, `bin/NetVarRepeaterTray.exe`.
-
-Opcje (są już w projekcie):
+1. Otwórz `NetVarRepeater.cbp`, kompilator GNU GCC (MinGW-w64 x86_64, GCC ≥ 8).
+2. Zbuduj **Service** i **Tray** (lub *Build → Select target → All*).
 
 | | Service | Tray |
 |---|---|---|
-| Kompilator | `-std=c++17 -O2 -Wall -Wextra -m64 -D_WIN32_WINNT=0x0601` | to samo + `-DUNICODE -D_UNICODE` |
+| Kompilator | `-std=c++17 -O2 -Wall -Wextra -Wno-cast-function-type -m64 -D_WIN32_WINNT=0x0601` | to samo + `-DUNICODE -D_UNICODE` |
 | Linker | `-static -static-libgcc -static-libstdc++ -s` | to samo + `-mwindows -municode` |
-| Biblioteki | `ws2_32 iphlpapi advapi32` | `shell32 user32 gdi32 advapi32` |
+| Biblioteki | `ws2_32 iphlpapi advapi32` | `shell32 user32 gdi32 comctl32 advapi32` |
 
-WinDivert jest ładowany dynamicznie (`LoadLibrary`), więc nie trzeba go linkować ani mieć nagłówków.
+WinDivert jest ładowany dynamicznie – nie trzeba go linkować.
 
 ## Instalacja
 
-1. Pobierz **WinDivert 2.2.x** (x64) z https://reactos.org/windivert.html i skopiuj `WinDivert.dll` oraz `WinDivert64.sys` do jednego katalogu z oboma plikami `.exe` i skryptami `.bat`. Pliki muszą pochodzić z tej samej wersji.
-2. Uruchom `install.bat` **jako administrator**. Skrypt tworzy usługę (auto-start, SYSTEM), katalog `C:\ProgramData\NetVarRepeater` (z prawem zapisu dla użytkowników – żeby edytor w trayu mógł zapisać konfigurację), wpis autostartu ikony (`HKLM\...\Run`) i uruchamia usługę.
-3. Nie przenoś katalogu po instalacji (usługa wskazuje na ścieżkę exe) – w razie potrzeby uruchom ponownie `install.bat`.
-4. Usunięcie: `uninstall.bat` (konfiguracja zostaje w ProgramData).
+1. Pobierz **WinDivert 2.2.x (x64)** z https://reactos.org/windivert.html; `WinDivert.dll` i `WinDivert64.sys` skopiuj do katalogu projektu (obok exe i `.bat`).
+2. `install.bat` **jako administrator**: tworzy usługę (auto-start, SYSTEM, restart po awarii), katalog `C:\ProgramData\NetVarRepeater` z prawem zapisu dla użytkowników, autostart ikony (`HKLM\...\Run`) i uruchamia usługę.
+3. Nie przenoś katalogu po instalacji – w razie potrzeby uruchom `install.bat` ponownie. Usunięcie: `uninstall.bat`.
+4. Test bez instalacji: `sc stop NetVarRepeater`, potem `NetVarRepeaterService.exe --console` w konsoli administratora.
 
-Uwaga: sterownik WinDivert wymaga uprawnień administratora; niektóre programy antywirusowe oznaczają `WinDivert64.sys` jako podejrzany – może być potrzebny wyjątek.
+Antywirusy mogą oznaczać `WinDivert64.sys` jako podejrzany – może być potrzebny wyjątek.
 
 ## Architektura
 
 ```
-tray.exe  --(named pipe \\.\pipe\NetVarRepeater, tryb komunikatów)-->  service.exe
-                                                                          |
-                                      WinDivert SNIFF (kopia pakietów) <--+--> sockety UDP (bind + IP_UNICAST_IF)
+tray.exe --(named pipe \\.\pipe\NetVarRepeater, 3 wątki serwera)--> service.exe
+                                                                       |
+                       WinDivert SNIFF (kopia pakietów) <--------------+--> gniazda UDP (bind + IP_UNICAST_IF)
 ```
 
-- Pipe: polecenia `STATUS / START / STOP / RESET`, odpowiedź = nagłówek + liczniki każdej reguły. Dostęp: zalogowani użytkownicy (odczyt/zapis), administratorzy i SYSTEM (pełny), klienci zdalni odrzucani.
-- Liczniki są atomowe; Start/Stop/Reset są serializowane i zatrzymują wątek odbiorczy przez `WinDivertShutdown(RECV)`.
+Pipe: polecenia `STATUS / START / STOP / RESET`; dostęp: zalogowani użytkownicy (odczyt/zapis), administratorzy i SYSTEM (pełny), klienci zdalni odrzucani. Wątek nadzorczy ponawia start po błędzie.
 
 ## Ograniczenia
 
-- Tylko IPv4. Sfragmentowane datagramy IP nie są składane (są pomijane i liczone jako „bez reguły”).
-- Przy zwykłym unicaście, gdy nikt nie nasłuchuje na porcie, system może odesłać ICMP „port unreachable” – dotyczy oryginalnego pakietu, nie kopii.
-- Pierwsze pakiety tuż po starcie systemu mogą zostać odrzucone (błąd wysyłki), jeśli sieć nie ma jeszcze adresu IP; interfejsy odświeżają się po błędzie w ciągu 2 s.
-- Przekazywanie na ten sam segment sieci, z którego pakiet przyszedł, przez unicast/broadcast kierowany jest możliwe – uważaj na pętle (np. dwie maszyny z tymi samymi regułami w jednej sieci).
-- Każdy zalogowany użytkownik może przez tray zmienić konfigurację i sterować przekazywaniem (usługa działa jako SYSTEM i wysyła UDP według tej konfiguracji). W środowisku wieloużytkownikowym zawęź uprawnienia katalogu `ProgramData\NetVarRepeater` i SDDL pipe'a w `service.cpp`.
-
-## Pytania otwarte / założenia
-
-1. `0.0.0.0` w kolumnie nadawcy potraktowano jako „dowolny nadawca”. Jeśli ma znaczyć wyłącznie broadcast, trzeba dodać warunek na adres docelowy pakietu (`255.255.255.255` / adres rozgłoszeniowy podsieci).
-2. W konfiguracji nie ma kolumny z interfejsem. Jeśli potrzebny jest ręczny wybór (np. wymuszony interfejs wyjściowy dla konkretnej reguły), można dodać opcjonalne piąte pole z adresem IP interfejsu.
+- Tylko IPv4; sfragmentowane datagramy IP nie są składane.
+- Pakiety nadane z tego samego komputera (loopback) nie są przekazywane.
+- Każdy zalogowany użytkownik może przez tray zmienić konfigurację i sterować usługą (działa jako SYSTEM). W środowisku wieloużytkownikowym zawęź uprawnienia katalogu `ProgramData\NetVarRepeater` i SDDL pipe'a w `service.cpp`.
+- Rozpoznawanie kart wirtualnych jest heurystyczne; nietypowa karta wirtualna bez rozpoznawalnej nazwy/MAC może zostać uznana za fizyczną (i odwrotnie). Wynik widać w logu i oknie statusu (`[wirt.]`).
+- Pierwsze pakiety tuż po starcie systemu mogą zakończyć się błędem wysyłki, jeśli sieć nie ma jeszcze adresu IP.
