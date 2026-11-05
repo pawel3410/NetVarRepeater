@@ -44,5 +44,6 @@ sc.exe start NetVarRepeater
 echo.
 echo Gotowe. Konfiguracja: %ProgramData%\NetVarRepeater\config.txt
 echo Ikona w zasobniku uruchomi sie przy nastepnym logowaniu (lub uruchom NetVarRepeaterTray.exe teraz).
-echo Jesli usluga nie startuje: Podglad zdarzen / services.msc.
+echo Log: %ProgramData%\NetVarRepeater\netvarrepeater.log (rotacja wg log_max_kb w config.txt)
+echo Jesli usluga nie startuje: sprawdz log oraz services.msc.
 pause
