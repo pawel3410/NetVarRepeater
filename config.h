@@ -3,6 +3,11 @@
 //
 // Format linii:  ip_nadawcy  port_odbiorczy  ip_docelowy  port_docelowy
 // Separatory: spacje, tabulatory lub przecinki. Komentarz: # lub ;
+//
+// Ustawienia (linie klucz = wartosc):
+//   exclude_virtual = yes|no   pomijaj karty wirtualne (VMware, VirtualBox, Hyper-V, VPN...), domyslnie yes
+//   max_pps         = N        limit pakietow/s na regule (ochrona przed petla), 0 = bez limitu, domyslnie 2000
+//   log_max_kb      = N        maks. rozmiar pliku logu w KB (16..102400), domyslnie 512
 // Adresy IPv4 w "host order" (a.b.c.d -> a<<24|b<<16|c<<8|d).
 // ============================================================
 #pragma once
@@ -21,8 +26,18 @@ struct NvrRuleCfg
     int      line;
 };
 
+struct NvrSettings
+{
+    bool     excludeVirtual;
+    uint32_t maxPps;
+    uint32_t logMaxKb;
+
+    NvrSettings() : excludeVirtual(true), maxPps(2000), logMaxKb(512) {}
+};
+
 struct NvrConfigResult
 {
+    NvrSettings              settings;
     std::vector<NvrRuleCfg>  rules;
     std::vector<std::string> errors;   // czytelne komunikaty "linia N: ..."
 };
@@ -86,6 +101,44 @@ inline bool NvrParsePort(const std::string& s, uint16_t& out)
     return true;
 }
 
+inline bool NvrParseBool(std::string v, bool& out)
+{
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i] >= 'A' && v[i] <= 'Z') v[i] = static_cast<char>(v[i] - 'A' + 'a');
+
+    if (v == "yes" || v == "true" || v == "1" || v == "tak" || v == "on")  { out = true;  return true; }
+    if (v == "no"  || v == "false" || v == "0" || v == "nie" || v == "off") { out = false; return true; }
+    return false;
+}
+
+inline bool NvrParseUInt(const std::string& s, uint32_t lo, uint32_t hi, uint32_t& out)
+{
+    if (s.empty() || s.size() > 9)
+        return false;
+
+    uint32_t v = 0;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] < '0' || s[i] > '9')
+            return false;
+        v = v * 10 + static_cast<uint32_t>(s[i] - '0');
+    }
+
+    if (v < lo || v > hi)
+        return false;
+
+    out = v;
+    return true;
+}
+
+inline std::string NvrTrim(const std::string& s)
+{
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r')) ++a;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r')) --b;
+    return s.substr(a, b - a);
+}
+
 inline std::string NvrIpToString(uint32_t ip)
 {
     char b[32];
@@ -124,6 +177,39 @@ inline NvrConfigResult NvrParseConfig(const std::string& text, size_t maxRules =
         size_t c = line.find_first_of("#;");
         if (c != std::string::npos)
             line.erase(c);
+
+        // ustawienie: klucz = wartosc
+        const size_t eq = line.find('=');
+        if (eq != std::string::npos)
+        {
+            std::string key = NvrTrim(line.substr(0, eq));
+            const std::string val = NvrTrim(line.substr(eq + 1));
+            for (size_t i = 0; i < key.size(); ++i)
+                if (key[i] >= 'A' && key[i] <= 'Z') key[i] = static_cast<char>(key[i] - 'A' + 'a');
+
+            const std::string pfx = "linia " + std::to_string(lineNo) + ": ";
+
+            if (key == "exclude_virtual")
+            {
+                if (!NvrParseBool(val, result.settings.excludeVirtual))
+                    result.errors.push_back(pfx + "exclude_virtual oczekuje yes/no");
+            }
+            else if (key == "max_pps")
+            {
+                if (!NvrParseUInt(val, 0, 1000000, result.settings.maxPps))
+                    result.errors.push_back(pfx + "max_pps oczekuje liczby 0..1000000");
+            }
+            else if (key == "log_max_kb")
+            {
+                if (!NvrParseUInt(val, 16, 102400, result.settings.logMaxKb))
+                    result.errors.push_back(pfx + "log_max_kb oczekuje liczby 16..102400");
+            }
+            else if (!key.empty())
+            {
+                result.errors.push_back(pfx + "nieznane ustawienie '" + key + "'");
+            }
+            continue;
+        }
 
         // tokeny: spacje / tab / przecinki / CR
         std::vector<std::string> tok;
