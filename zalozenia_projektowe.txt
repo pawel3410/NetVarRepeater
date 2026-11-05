@@ -5,6 +5,7 @@ ip_nadawcy, port n aktórym odebrano pakiet, ip na który ma byc przekazany, por
 - ip nadawcy może byc 0.0.0.0 jezeli pakiet został nadany jako broadcast, ip n aktory ma byc przekazany takze moze byc broadcast,
 - wykozystanie windivert w taki sposób aby port na ktorym nasluchujemy nie był blokowany dla innych programów,
 - po najechaniu kursorem na ikonke w systray ma byc wyswietlona liczba odczytanych i przekazanych pakietów a takze bledow wyslania dla kazdej konfiguracji, czas działania i czas rozpoczecia działania, po kliknieciu prawym przyciskiem myszy pokaze sie menu z konfiguracja ktora mozna edytowac, start (wczytuje konfiguracje gdyby sie zmieniła), stop, reset (wczytuje na nowo konfiguracje i resetuje liczniki),
+- wszystkie pliki projektu maja być w jednym poziome, bez katalogów,
 
 przykładowa konfiguracja:
 0.0.0.0 1202 192.168.1.10 1203
