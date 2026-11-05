@@ -1,5 +1,5 @@
 // ============================================================
-// NetVarRepeaterService - usluga Windows
+// NetVarRepeaterService - usluga Windows (tryb konsolowy: --console)
 //
 // Przechwytuje (WinDivert, warstwa NETWORK, tryb SNIFF) przychodzace
 // datagramy UDP i przekazuje ich tresc (payload) wedlug regul z config.txt.
@@ -20,9 +20,11 @@
 #include <sddl.h>
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
 #include <memory>
 #include <set>
 #include <string>
@@ -36,6 +38,138 @@
 #endif
 
 // ------------------------------------------------------------
+// Ustawienia (z config.txt) i stan globalny
+// ------------------------------------------------------------
+static std::atomic<bool>     g_excludeVirtual(true);
+static std::atomic<uint32_t> g_maxPps(2000);
+static std::atomic<uint32_t> g_logMaxKb(512);
+
+static CRITICAL_SECTION g_logCs;    // log
+static CRITICAL_SECTION g_dataCs;   // g_rules (podmiana), g_cfgMessage, g_startTime, g_ifTable
+static CRITICAL_SECTION g_ctlCs;    // serializuje Start/Stop/Reset/auto-ponowienie
+
+static bool g_console = false;
+
+static SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
+static SERVICE_STATUS        g_serviceStatus;
+static HANDLE                g_stopEvent = nullptr;
+
+static const int NUM_PIPE_THREADS = 3;   // status odpowiada nawet gdy trwa Start/Reset
+static HANDLE g_pipeThreads[NUM_PIPE_THREADS] = { nullptr, nullptr, nullptr };
+static HANDLE g_supervisor = nullptr;
+
+static uint64_t NowFileTime()
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+// ------------------------------------------------------------
+// Pomocnicze: UTF-8, opis bledow
+// ------------------------------------------------------------
+static std::string Utf8(const std::wstring& w)
+{
+    if (w.empty())
+        return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                        &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::string ErrStr(DWORD code)
+{
+    if (code == NVR_ERR_NO_RULES)
+        return "brak poprawnych reguł w konfiguracji";
+
+    wchar_t buf[512];
+    DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                             nullptr, code, 0, buf, 512, nullptr);
+    std::string s = "kod " + std::to_string(code);
+    if (n > 0)
+    {
+        while (n > 0 && (buf[n - 1] == L'\r' || buf[n - 1] == L'\n' || buf[n - 1] == L' '))
+            --n;
+        s += " (" + Utf8(std::wstring(buf, n)) + ")";
+    }
+    return s;
+}
+
+static std::string ErrHint(DWORD code)
+{
+    switch (code)
+    {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:     return "brak WinDivert64.sys obok pliku exe?";
+        case ERROR_ACCESS_DENIED:      return "wymagane uprawnienia administratora / SYSTEM";
+        case ERROR_INVALID_IMAGE_HASH: return "sterownik zablokowany (podpis / Secure Boot / antywirus)";
+        case 1275:                     return "sterownik zablokowany przez system (ERROR_DRIVER_BLOCKED)";
+        case ERROR_INVALID_PARAMETER:  return "niepoprawny filtr WinDivert";
+        case ERROR_SERVICE_DOES_NOT_EXIST: return "sterownik WinDivert nie zainstalowany";
+        default: return std::string();
+    }
+}
+
+// ------------------------------------------------------------
+// Log z ograniczeniem wielkosci (rotacja do pliku .1)
+// Maksymalne zajecie dysku = ok. 2 x log_max_kb.
+// ------------------------------------------------------------
+static void Log(const char* fmt, ...)
+{
+    char msg[1500];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    char line[1600];
+    const int len = std::snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d  %s\r\n",
+                                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, msg);
+    if (len <= 0)
+        return;
+
+    EnterCriticalSection(&g_logCs);
+
+    if (g_console)
+    {
+        std::fwrite(line, 1, static_cast<size_t>(len), stdout);
+        std::fflush(stdout);
+    }
+
+    const std::wstring path = NvrLogPath();
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        LARGE_INTEGER size;
+        const unsigned long long limit = static_cast<unsigned long long>(g_logMaxKb.load()) * 1024ull;
+
+        if (GetFileSizeEx(h, &size) && static_cast<unsigned long long>(size.QuadPart) > limit)
+        {
+            CloseHandle(h);
+            MoveFileExW(path.c_str(), (path + L".1").c_str(), MOVEFILE_REPLACE_EXISTING);
+            h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            DWORD w = 0;
+            WriteFile(h, line, static_cast<DWORD>(len), &w, nullptr);
+            CloseHandle(h);
+        }
+    }
+
+    LeaveCriticalSection(&g_logCs);
+}
+
+// ------------------------------------------------------------
 // WinDivert (ladowany dynamicznie z katalogu exe)
 // ------------------------------------------------------------
 static const int      WD_LAYER_NETWORK = 0;
@@ -47,7 +181,7 @@ static const int      WD_SHUTDOWN_RECV = 0x1;
 struct DivertAddress
 {
     int64_t  timestamp;
-    uint32_t flags;        // Layer:8 Event:8 Sniffed:1 Outbound:1 Loopback:1 Impostor:1 IPv6:1 ...
+    uint32_t flags;
     uint32_t reserved2;
     uint32_t ifIdx;        // WINDIVERT_DATA_NETWORK.IfIdx  <- interfejs, na ktorym odebrano pakiet
     uint32_t subIfIdx;
@@ -66,101 +200,6 @@ static FnWinDivertRecv     g_wdRecv = nullptr;
 static FnWinDivertClose    g_wdClose = nullptr;
 static FnWinDivertShutdown g_wdShutdown = nullptr;
 
-// ------------------------------------------------------------
-// Regula + liczniki
-// ------------------------------------------------------------
-struct OutSock
-{
-    SOCKET   s;
-    uint32_t ifIdx;
-};
-
-struct Rule
-{
-    NvrRuleCfg cfg;
-    sockaddr_in dst;
-    std::vector<OutSock> outs;      // tylko watek relay (i Start/Stop gdy relay stoi)
-
-    std::atomic<uint32_t> outMode;
-    std::atomic<uint32_t> outIfIdx;
-    std::atomic<uint32_t> outCount;
-    std::atomic<uint32_t> lastRxIf;
-    std::atomic<uint32_t> txIf[NVR_MAX_TX_SHOW];
-    std::atomic<uint32_t> lastError;
-    std::atomic<uint64_t> received;
-    std::atomic<uint64_t> forwarded;
-    std::atomic<uint64_t> bytes;
-    std::atomic<uint64_t> errors;
-
-    explicit Rule(const NvrRuleCfg& c)
-        : cfg(c), outMode(NVR_OUT_OS), outIfIdx(0), outCount(0), lastRxIf(0), lastError(0),
-          received(0), forwarded(0), bytes(0), errors(0)
-    {
-        for (uint32_t i = 0; i < NVR_MAX_TX_SHOW; ++i)
-            txIf[i].store(0);
-        std::memset(&dst, 0, sizeof(dst));
-        dst.sin_family = AF_INET;
-        dst.sin_port = htons(c.dstPort);
-        dst.sin_addr.s_addr = htonl(c.dstIp);
-    }
-
-    void CloseSockets()
-    {
-        for (size_t i = 0; i < outs.size(); ++i)
-            if (outs[i].s != INVALID_SOCKET)
-                closesocket(outs[i].s);
-        outs.clear();
-        PublishTx();
-    }
-
-    // Publikuje liste interfejsow wysylajacych (czytana przez watek pipe)
-    void PublishTx()
-    {
-        const uint32_t n = static_cast<uint32_t>(outs.size());
-        for (uint32_t i = 0; i < NVR_MAX_TX_SHOW; ++i)
-            txIf[i].store(i < n ? outs[i].ifIdx : 0);
-        outCount.store(n);
-    }
-
-    ~Rule() { CloseSockets(); }
-};
-
-typedef std::vector<std::unique_ptr<Rule> > RuleList;
-
-// ------------------------------------------------------------
-// Stan globalny
-// ------------------------------------------------------------
-static SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
-static SERVICE_STATUS        g_serviceStatus;
-static HANDLE                g_stopEvent = nullptr;     // zatrzymanie uslugi
-static HANDLE                g_pipeThread = nullptr;
-
-static CRITICAL_SECTION g_dataCs;   // chroni g_rules (podmiana), g_cfgMessage, g_startTime
-static CRITICAL_SECTION g_ctlCs;    // serializuje Start/Stop/Reset
-
-static RuleList     g_rules;
-static std::string  g_cfgMessage;
-static uint32_t     g_cfgErrorCount = 0;
-static uint64_t     g_startTime = 0;
-
-static HANDLE               g_relayThread = nullptr;
-static HANDLE               g_divert = INVALID_HANDLE_VALUE;
-static std::atomic<bool>    g_active(false);
-static std::atomic<bool>    g_relayStop(false);
-static std::atomic<uint32_t> g_lastError(0);
-static std::atomic<uint64_t> g_totalSeen(0);
-static std::atomic<uint64_t> g_totalIgnored(0);
-
-static uint64_t NowFileTime()
-{
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-}
-
-// ------------------------------------------------------------
-// Ladowanie WinDivert
-// ------------------------------------------------------------
 static std::wstring ExeDir()
 {
     wchar_t path[MAX_PATH * 2];
@@ -170,18 +209,21 @@ static std::wstring ExeDir()
     return slash == std::wstring::npos ? L"." : p.substr(0, slash);
 }
 
+static std::atomic<uint32_t> g_lastError(0);
+
 static bool LoadWinDivert()
 {
     if (g_dll)
         return true;
 
-    // pelna sciezka - katalog roboczy uslugi to System32
-    std::wstring dll = ExeDir() + L"\\WinDivert.dll";
+    const std::wstring dll = ExeDir() + L"\\WinDivert.dll";
     g_dll = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 
     if (!g_dll)
     {
-        g_lastError.store(GetLastError());
+        const DWORD e = GetLastError();
+        g_lastError.store(e);
+        Log("BŁĄD: nie można załadować WinDivert.dll z '%s': %s", Utf8(dll).c_str(), ErrStr(e).c_str());
         return false;
     }
 
@@ -193,6 +235,7 @@ static bool LoadWinDivert()
     if (!g_wdOpen || !g_wdRecv || !g_wdClose || !g_wdShutdown)
     {
         g_lastError.store(ERROR_PROC_NOT_FOUND);
+        Log("BŁĄD: WinDivert.dll nie zawiera wymaganych funkcji (wymagana wersja 2.x)");
         FreeLibrary(g_dll);
         g_dll = nullptr;
         return false;
@@ -202,40 +245,205 @@ static bool LoadWinDivert()
 }
 
 // ------------------------------------------------------------
+// Regula + liczniki
+// ------------------------------------------------------------
+struct OutSock
+{
+    SOCKET   s;
+    uint32_t ifIdx;
+};
+
+struct Rule
+{
+    NvrRuleCfg  cfg;
+    sockaddr_in dst;
+    bool        directedBcast;      // adres docelowy to broadcast kierowany
+    std::vector<OutSock> outs;      // tylko watek relay (lub Start/Stop gdy relay stoi)
+
+    // dane tylko dla watku relay
+    bool       failed;              // ostatnia wysylka sie nie powiodla -> odtworz gniazda
+    double     tokens;
+    ULONGLONG  tokTick;
+    ULONGLONG  lastLogTick;
+
+    std::atomic<uint32_t> outMode;
+    std::atomic<uint32_t> outIfIdx;
+    std::atomic<uint32_t> outCount;
+    std::atomic<uint32_t> lastRxIf;
+    std::atomic<uint32_t> txIf[NVR_MAX_TX_SHOW];
+    std::atomic<uint32_t> lastError;
+    std::atomic<uint64_t> received;
+    std::atomic<uint64_t> forwarded;
+    std::atomic<uint64_t> errors;
+    std::atomic<uint64_t> skipped;
+    std::atomic<uint64_t> bytesRx;
+    std::atomic<uint64_t> bytesTx;
+
+    explicit Rule(const NvrRuleCfg& c)
+        : cfg(c), directedBcast(false), failed(false), tokens(0), tokTick(0), lastLogTick(0),
+          outMode(NVR_OUT_OS), outIfIdx(0), outCount(0), lastRxIf(0), lastError(0),
+          received(0), forwarded(0), errors(0), skipped(0), bytesRx(0), bytesTx(0)
+    {
+        for (uint32_t i = 0; i < NVR_MAX_TX_SHOW; ++i)
+            txIf[i].store(0);
+        std::memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(c.dstPort);
+        dst.sin_addr.s_addr = htonl(c.dstIp);
+    }
+
+    void PublishTx()
+    {
+        const uint32_t n = static_cast<uint32_t>(outs.size());
+        for (uint32_t i = 0; i < NVR_MAX_TX_SHOW; ++i)
+            txIf[i].store(i < n ? outs[i].ifIdx : 0);
+        outCount.store(n);
+    }
+
+    void CloseSockets()
+    {
+        for (size_t i = 0; i < outs.size(); ++i)
+            if (outs[i].s != INVALID_SOCKET)
+                closesocket(outs[i].s);
+        outs.clear();
+        PublishTx();
+    }
+
+    // czy wolno zapisac wpis do logu (max raz na 60 s na regule)
+    bool LogOk()
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (lastLogTick != 0 && now - lastLogTick < 60000)
+            return false;
+        lastLogTick = now;
+        return true;
+    }
+
+    ~Rule() { CloseSockets(); }
+};
+
+typedef std::vector<std::unique_ptr<Rule> > RuleList;
+
+static RuleList     g_rules;
+static std::string  g_cfgMessage;
+static uint32_t     g_cfgErrorCount = 0;
+static uint64_t     g_startTime = 0;
+
+static HANDLE                g_relayThread = nullptr;
+static HANDLE                g_divert = INVALID_HANDLE_VALUE;
+static std::atomic<bool>     g_active(false);
+static std::atomic<bool>     g_relayStop(false);
+static std::atomic<bool>     g_userStopped(false);
+static std::atomic<uint64_t> g_nextRetryTick(0);
+static std::atomic<uint64_t> g_totalSeen(0);
+static std::atomic<uint64_t> g_totalIgnored(0);
+static std::atomic<uint64_t> g_totalLoop(0);
+
+static std::string RuleName(const NvrRuleCfg& c)
+{
+    return NvrIpToString(c.srcIp) + ":" + std::to_string(c.listenPort) + " -> " +
+           NvrIpToString(c.dstIp) + ":" + std::to_string(c.dstPort);
+}
+
+// ------------------------------------------------------------
 // Identyfikacja interfejsow sieciowych
 // ------------------------------------------------------------
 struct IfAddr
 {
     uint32_t ifIdx;
-    uint32_t ip;      // host order
-    uint32_t mask;    // host order
+    uint32_t ip;          // host order
+    uint32_t mask;        // host order
+    bool     isVirtual;
     std::wstring name;
 };
 
 static std::vector<IfAddr> g_ifTable;   // ostatnio wyliczone interfejsy (pod g_dataCs)
 
-// Lista adresow IPv4 interfejsow, ktore sa UP i nie sa loopbackiem.
+static bool ContainsNoCase(const std::wstring& hay, const wchar_t* needle)
+{
+    std::wstring h = hay;
+    for (size_t i = 0; i < h.size(); ++i)
+        h[i] = static_cast<wchar_t>(std::towlower(h[i]));
+
+    std::wstring n = needle;
+    for (size_t i = 0; i < n.size(); ++i)
+        n[i] = static_cast<wchar_t>(std::towlower(n[i]));
+
+    return h.find(n) != std::wstring::npos;
+}
+
+// Karta wirtualna: typ interfejsu inny niz fizyczny (Ethernet/Wi-Fi/WWAN),
+// znany prefiks MAC (VMware, VirtualBox, Hyper-V, Parallels, QEMU, Xen)
+// lub charakterystyczna nazwa/opis (VPN, TAP, WSL, Docker, vEthernet...).
+static bool IsVirtualAdapter(const IP_ADAPTER_ADDRESSES* a)
+{
+    switch (a->IfType)
+    {
+        case 6:     // Ethernet
+        case 71:    // Wi-Fi
+        case 117:   // Gigabit Ethernet
+        case 243:   // WWAN
+        case 244:   // WWAN
+            break;
+        default:
+            return true;    // tunele, PPP, loopback, ...
+    }
+
+    if (a->PhysicalAddressLength >= 3)
+    {
+        const unsigned char* m = a->PhysicalAddress;
+        static const unsigned char oui[][3] =
+        {
+            {0x00,0x05,0x69}, {0x00,0x0C,0x29}, {0x00,0x1C,0x14}, {0x00,0x50,0x56},   // VMware
+            {0x08,0x00,0x27}, {0x0A,0x00,0x27},                                       // VirtualBox
+            {0x00,0x15,0x5D},                                                         // Hyper-V
+            {0x00,0x1C,0x42},                                                         // Parallels
+            {0x00,0x16,0x3E},                                                         // Xen
+            {0x52,0x54,0x00}                                                          // QEMU/KVM
+        };
+        for (size_t i = 0; i < sizeof(oui) / sizeof(oui[0]); ++i)
+            if (m[0] == oui[i][0] && m[1] == oui[i][1] && m[2] == oui[i][2])
+                return true;
+    }
+
+    std::wstring text;
+    if (a->Description)  text += a->Description;
+    text += L" | ";
+    if (a->FriendlyName) text += a->FriendlyName;
+
+    static const wchar_t* kw[] =
+    {
+        L"vmware", L"virtualbox", L"vbox", L"hyper-v", L"vethernet", L"virtual", L"wsl",
+        L"docker", L"tap-windows", L"tap-", L"wintun", L"wireguard", L"openvpn", L"tailscale",
+        L"zerotier", L"vpn", L"tunnel", L"loopback", L"npcap", L"parallels", L"qemu", L"xen ",
+        L"bluetooth", L"host-only", L"anyconnect", L"globalprotect", L"fortinet", L"teredo",
+        L"isatap", L"6to4"
+    };
+    for (size_t i = 0; i < sizeof(kw) / sizeof(kw[0]); ++i)
+        if (ContainsNoCase(text, kw[i]))
+            return true;
+
+    return false;
+}
+
+// Wszystkie interfejsy IPv4 w stanie Up (bez loopbacku), z flaga isVirtual.
 static std::vector<IfAddr> EnumInterfaces()
 {
     std::vector<IfAddr> result;
 
     ULONG size = 16 * 1024;
     std::vector<unsigned char> buf;
-    ULONG rc;
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
 
-    for (int attempt = 0; attempt < 4; ++attempt)
+    for (int attempt = 0; attempt < 4 && rc == ERROR_BUFFER_OVERFLOW; ++attempt)
     {
         buf.resize(size);
         rc = GetAdaptersAddresses(
             AF_INET,
-            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-            GAA_FLAG_SKIP_DNS_SERVER,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
             nullptr,
             reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()),
             &size);
-
-        if (rc != ERROR_BUFFER_OVERFLOW)
-            break;
     }
 
     if (rc != NO_ERROR)
@@ -247,16 +455,20 @@ static std::vector<IfAddr> EnumInterfaces()
         if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK || a->OperStatus != IfOperStatusUp)
             continue;
 
+        const bool isVirt = IsVirtualAdapter(a);
+
         for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u; u = u->Next)
         {
             if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET)
                 continue;
 
             const sockaddr_in* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
+
             IfAddr ia;
             ia.ifIdx = a->IfIndex;
-            ia.name = a->FriendlyName ? a->FriendlyName : L"";
             ia.ip = ntohl(sin->sin_addr.s_addr);
+            ia.isVirtual = isVirt;
+            ia.name = a->FriendlyName ? a->FriendlyName : L"";
 
             unsigned prefix = u->OnLinkPrefixLength;
             if (prefix > 32) prefix = 32;
@@ -270,6 +482,37 @@ static std::vector<IfAddr> EnumInterfaces()
     return result;
 }
 
+static uint64_t IfSignature(const std::vector<IfAddr>& v)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        const uint32_t parts[4] = { v[i].ifIdx, v[i].ip, v[i].mask, v[i].isVirtual ? 1u : 0u };
+        for (int k = 0; k < 4; ++k)
+        {
+            h ^= parts[k];
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+static const IfAddr* FindIf(const std::vector<IfAddr>& v, uint32_t ifIdx)
+{
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].ifIdx == ifIdx)
+            return &v[i];
+    return nullptr;
+}
+
+static bool IsLocalIp(const std::vector<IfAddr>& v, uint32_t ip)
+{
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].ip == ip)
+            return true;
+    return false;
+}
+
 static SOCKET MakeOutSocket(uint32_t bindIp, uint32_t ifIdx)
 {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -281,8 +524,7 @@ static SOCKET MakeOutSocket(uint32_t bindIp, uint32_t ifIdx)
 
     if (ifIdx != 0)
     {
-        // IP_UNICAST_IF: indeks interfejsu w network byte order (IPv4)
-        DWORD v = htonl(ifIdx);
+        DWORD v = htonl(ifIdx);     // IP_UNICAST_IF: indeks w network byte order
         setsockopt(s, IPPROTO_IP, IP_UNICAST_IF, reinterpret_cast<const char*>(&v), sizeof(v));
     }
 
@@ -304,37 +546,46 @@ static SOCKET MakeOutSocket(uint32_t bindIp, uint32_t ifIdx)
     return s;
 }
 
+static void AddOut(Rule& r, const IfAddr& ia)
+{
+    SOCKET s = MakeOutSocket(ia.ip, ia.ifIdx);
+    if (s == INVALID_SOCKET)
+        return;
+    OutSock o = { s, ia.ifIdx };
+    r.outs.push_back(o);
+}
+
 // Wybiera interfejs/gniazda wyjsciowe dla reguly (patrz README: "Identyfikacja interfejsow").
-static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
+static void BuildOutputs(Rule& r, const std::vector<IfAddr>& all)
 {
     r.CloseSockets();
     r.outMode.store(NVR_OUT_OS);
     r.outIfIdx.store(0);
+    r.directedBcast = false;
+    r.failed = false;
+
+    // karty wirtualne sa pomijane przy wyborze wyjscia (exclude_virtual = yes)
+    std::vector<IfAddr> ifs;
+    for (size_t i = 0; i < all.size(); ++i)
+        if (!(g_excludeVirtual.load() && all[i].isVirtual))
+            ifs.push_back(all[i]);
 
     const uint32_t dst = r.cfg.dstIp;
 
-    // 1) broadcast ograniczony 255.255.255.255 -> po jednym gnieZdzie na interfejs
+    // 1) broadcast ograniczony -> po jednym gniezdzie na interfejs
     if (dst == 0xFFFFFFFFu)
     {
         std::set<uint32_t> seen;
         for (size_t i = 0; i < ifs.size(); ++i)
-        {
-            if (!seen.insert(ifs[i].ifIdx).second)
-                continue;
+            if (seen.insert(ifs[i].ifIdx).second)
+                AddOut(r, ifs[i]);
 
-            SOCKET s = MakeOutSocket(ifs[i].ip, ifs[i].ifIdx);
-            if (s != INVALID_SOCKET)
-            {
-                OutSock o = { s, ifs[i].ifIdx };
-                r.outs.push_back(o);
-            }
-        }
         r.outMode.store(NVR_OUT_BCAST_ALL);
         r.PublishTx();
         return;
     }
 
-    // 2) broadcast kierowany (np. 192.168.1.255) -> interfejs z ta podsiecia
+    // 2) broadcast kierowany -> interfejs z ta podsiecia
     for (size_t i = 0; i < ifs.size(); ++i)
     {
         const IfAddr& ia = ifs[i];
@@ -343,11 +594,10 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
 
         if (dst == (ia.ip | ~ia.mask))
         {
-            SOCKET s = MakeOutSocket(ia.ip, ia.ifIdx);
-            if (s != INVALID_SOCKET)
+            r.directedBcast = true;
+            AddOut(r, ia);
+            if (!r.outs.empty())
             {
-                OutSock o = { s, ia.ifIdx };
-                r.outs.push_back(o);
                 r.outMode.store(NVR_OUT_BOUND);
                 r.outIfIdx.store(ia.ifIdx);
                 r.PublishTx();
@@ -365,11 +615,9 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
             if (ifs[i].ifIdx != bestIf)
                 continue;
 
-            SOCKET s = MakeOutSocket(ifs[i].ip, ifs[i].ifIdx);
-            if (s != INVALID_SOCKET)
+            AddOut(r, ifs[i]);
+            if (!r.outs.empty())
             {
-                OutSock o = { s, ifs[i].ifIdx };
-                r.outs.push_back(o);
                 r.outMode.store(NVR_OUT_BOUND);
                 r.outIfIdx.store(ifs[i].ifIdx);
                 r.PublishTx();
@@ -378,7 +626,7 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
         }
     }
 
-    // 4) np. adres lokalny / loopback / brak trasy -> decyduje system
+    // 4) adres lokalny / loopback / interfejs wykluczony -> decyduje system
     SOCKET s = MakeOutSocket(0, 0);
     if (s != INVALID_SOCKET)
     {
@@ -386,6 +634,48 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& ifs)
         r.outs.push_back(o);
     }
     r.PublishTx();
+}
+
+static void LogInterfaces(const std::vector<IfAddr>& v)
+{
+    if (v.empty())
+        Log("Interfejsy: brak aktywnych kart IPv4");
+
+    for (size_t i = 0; i < v.size(); ++i)
+        Log("Interfejs [if %u] '%s' %s/%u %s", v[i].ifIdx, Utf8(v[i].name).c_str(),
+            NvrIpToString(v[i].ip).c_str(), 32 - (v[i].mask == 0 ? 32u : static_cast<unsigned>(__builtin_ctz(v[i].mask))),
+            v[i].isVirtual ? (g_excludeVirtual.load() ? "[wirtualna - POMIJANA]" : "[wirtualna]") : "[fizyczna]");
+}
+
+static void LogOutputs(const Rule& r)
+{
+    std::string list;
+    for (size_t i = 0; i < r.outs.size(); ++i)
+        list += (i ? ", if " : "if ") + std::to_string(r.outs[i].ifIdx);
+
+    const uint32_t mode = r.outMode.load();
+    Log("Reguła %s: wyjście = %s%s", RuleName(r.cfg).c_str(),
+        mode == NVR_OUT_BCAST_ALL ? "broadcast na kartach: " :
+        mode == NVR_OUT_BOUND     ? "karta: " : "wybór systemu ",
+        list.c_str());
+}
+
+// Przebudowuje wyjscia wszystkich regul i publikuje tabele interfejsow.
+static void ApplyInterfaces(const std::vector<IfAddr>& ifs, bool logIt)
+{
+    EnterCriticalSection(&g_dataCs);
+    g_ifTable = ifs;
+    LeaveCriticalSection(&g_dataCs);
+
+    if (logIt)
+        LogInterfaces(ifs);
+
+    for (size_t i = 0; i < g_rules.size(); ++i)
+    {
+        BuildOutputs(*g_rules[i], ifs);
+        if (logIt)
+            LogOutputs(*g_rules[i]);
+    }
 }
 
 // ------------------------------------------------------------
@@ -428,11 +718,45 @@ static bool ParseUdp(const unsigned char* p, UINT len,
 }
 
 // ------------------------------------------------------------
-// Watek odbiorczo-przekazujacy
+// Przekazywanie jednego pakietu
+//
+// Liczniki reguly (spojne): received = forwarded + errors + skipped
+//   forwarded - wyslano poprawnie na wszystkie wyjscia
+//   errors    - przynajmniej jedna wysylka sie nie powiodla / brak wyjscia
+//   skipped   - celowo pominiety (limit pps, ochrona przed petla)
+//   bytesTx   - suma bajtow faktycznie wyslanych (po kazdym wyjsciu)
 // ------------------------------------------------------------
 static void ForwardOne(Rule& r, const unsigned char* payload, UINT plen,
                        uint32_t rxIfIdx, bool& needRefresh)
 {
+    // Ochrona przed petla / burza: limit pakietow na sekunde na regule (token bucket)
+    const uint32_t maxPps = g_maxPps.load();
+    if (maxPps > 0)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (r.tokTick == 0)
+        {
+            r.tokens = maxPps;
+            r.tokTick = now;
+        }
+        else
+        {
+            r.tokens += static_cast<double>(now - r.tokTick) * maxPps / 1000.0;
+            if (r.tokens > maxPps) r.tokens = maxPps;
+            r.tokTick = now;
+        }
+
+        if (r.tokens < 1.0)
+        {
+            r.skipped.fetch_add(1);
+            if (r.LogOk())
+                Log("OSTRZEŻENIE: reguła %s przekroczyła limit %u pakietów/s - pakiety pomijane (możliwa pętla)",
+                    RuleName(r.cfg).c_str(), maxPps);
+            return;
+        }
+        r.tokens -= 1.0;
+    }
+
     int attempted = 0, failed = 0;
 
     for (size_t i = 0; i < r.outs.size(); ++i)
@@ -443,57 +767,103 @@ static void ForwardOne(Rule& r, const unsigned char* payload, UINT plen,
         if (r.outMode.load() == NVR_OUT_BCAST_ALL && o.ifIdx == rxIfIdx)
             continue;
 
+        // broadcast kierowany na te sama siec i ten sam port = ping-pong z drugim repeaterem
+        if (r.directedBcast && o.ifIdx == rxIfIdx && r.cfg.dstPort == r.cfg.listenPort)
+            continue;
+
         ++attempted;
 
         const int sent = sendto(o.s, reinterpret_cast<const char*>(payload),
                                 static_cast<int>(plen), 0,
                                 reinterpret_cast<const sockaddr*>(&r.dst), sizeof(r.dst));
 
-        if (sent != static_cast<int>(plen))
+        if (sent == static_cast<int>(plen))
+        {
+            r.bytesTx.fetch_add(plen);
+        }
+        else
         {
             ++failed;
-            r.errors.fetch_add(1);
-            r.lastError.store(static_cast<uint32_t>(WSAGetLastError()));
-            needRefresh = true;
+            const DWORD e = static_cast<DWORD>(WSAGetLastError());
+            r.lastError.store(e);
+            if (r.LogOk())
+                Log("BŁĄD wysyłania (reguła %s, karta if %u): %s", RuleName(r.cfg).c_str(),
+                    o.ifIdx, ErrStr(e).c_str());
         }
+    }
+
+    if (r.outs.empty())
+    {
+        r.errors.fetch_add(1);
+        r.lastError.store(ERROR_NETWORK_UNREACHABLE);
+        r.failed = true;
+        needRefresh = true;
+        if (r.LogOk())
+            Log("BŁĄD: reguła %s nie ma żadnego interfejsu wyjściowego (brak sieci / karta wykluczona)",
+                RuleName(r.cfg).c_str());
+        return;
     }
 
     if (attempted == 0)
     {
-        // brak interfejsu wyjsciowego (np. siec jeszcze nie wstala)
-        if (r.outMode.load() != NVR_OUT_BCAST_ALL || r.outs.empty())
-        {
-            r.errors.fetch_add(1);
-            r.lastError.store(ERROR_NETWORK_UNREACHABLE);
-            needRefresh = true;
-        }
+        r.skipped.fetch_add(1);     // jedyny dostepny interfejs to odbiorczy (ochrona przed petla)
         return;
     }
 
-    if (failed == 0)
+    if (failed > 0)
     {
-        r.forwarded.fetch_add(1);
-        r.bytes.fetch_add(plen);
+        r.errors.fetch_add(1);
+        r.failed = true;
+        needRefresh = true;
+        return;
     }
+
+    r.forwarded.fetch_add(1);
 }
 
-static void RefreshOutputs()
+// Sprawdza, czy zmienila sie lista interfejsow; gniazda sa odtwarzane tylko gdy tak.
+static void CheckInterfaces(std::vector<IfAddr>& ifs, uint64_t& sig, bool& needRefresh)
 {
-    const std::vector<IfAddr> ifs = EnumInterfaces();
+    const std::vector<IfAddr> cur = EnumInterfaces();
+    const uint64_t s2 = IfSignature(cur);
 
-    EnterCriticalSection(&g_dataCs);
-    g_ifTable = ifs;
-    LeaveCriticalSection(&g_dataCs);
+    if (s2 != sig)
+    {
+        Log("Zmiana interfejsów sieciowych - odtwarzam gniazda wyjściowe");
+        ifs = cur;
+        sig = s2;
+        ApplyInterfaces(ifs, true);
+        needRefresh = false;
+        return;
+    }
 
-    for (size_t i = 0; i < g_rules.size(); ++i)
-        BuildOutputs(*g_rules[i], ifs);
+    if (needRefresh)
+    {
+        for (size_t i = 0; i < g_rules.size(); ++i)
+        {
+            Rule& r = *g_rules[i];
+            if (r.failed)
+            {
+                BuildOutputs(r, ifs);
+                LogOutputs(r);
+            }
+        }
+        needRefresh = false;
+    }
 }
 
 static DWORD WINAPI RelayThread(void*)
 {
     std::vector<unsigned char> buf(65535);
     DivertAddress addr;
-    ULONGLONG lastRefresh = GetTickCount64();
+
+    std::vector<IfAddr> ifs;
+    EnterCriticalSection(&g_dataCs);
+    ifs = g_ifTable;
+    LeaveCriticalSection(&g_dataCs);
+
+    uint64_t sig = IfSignature(ifs);
+    ULONGLONG lastCheck = GetTickCount64();
     bool needRefresh = false;
 
     while (!g_relayStop.load())
@@ -508,6 +878,8 @@ static DWORD WINAPI RelayThread(void*)
                 break;
 
             g_lastError.store(e);
+            Log("BŁĄD odbioru WinDivert: %s", ErrStr(e).c_str());
+
             if (e == ERROR_INVALID_HANDLE)
                 break;
 
@@ -516,6 +888,13 @@ static DWORD WINAPI RelayThread(void*)
         }
 
         g_totalSeen.fetch_add(1);
+
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastCheck >= 5000 || (needRefresh && now - lastCheck >= 2000))
+        {
+            CheckInterfaces(ifs, sig, needRefresh);
+            lastCheck = now;
+        }
 
         uint32_t srcIp = 0;
         uint16_t dstPort = 0;
@@ -526,6 +905,24 @@ static DWORD WINAPI RelayThread(void*)
         {
             g_totalIgnored.fetch_add(1);
             continue;
+        }
+
+        // Ochrona przed petla: pakiet z naszym wlasnym adresem zrodlowym
+        if (IsLocalIp(ifs, srcIp))
+        {
+            g_totalLoop.fetch_add(1);
+            continue;
+        }
+
+        // Pakiety z kart wirtualnych (exclude_virtual = yes)
+        if (g_excludeVirtual.load())
+        {
+            const IfAddr* rx = FindIf(ifs, addr.ifIdx);
+            if (rx && rx->isVirtual)
+            {
+                g_totalLoop.fetch_add(1);
+                continue;
+            }
         }
 
         bool matched = false;
@@ -541,21 +938,13 @@ static DWORD WINAPI RelayThread(void*)
 
             matched = true;
             r.received.fetch_add(1);
+            r.bytesRx.fetch_add(plen);
             r.lastRxIf.store(addr.ifIdx);
             ForwardOne(r, payload, plen, addr.ifIdx, needRefresh);
         }
 
         if (!matched)
             g_totalIgnored.fetch_add(1);
-
-        // Odswiezenie interfejsow: po bledzie wysylki (min. 2 s), a poza tym co 30 s
-        const ULONGLONG now = GetTickCount64();
-        if ((needRefresh && now - lastRefresh >= 2000) || now - lastRefresh >= 30000)
-        {
-            RefreshOutputs();
-            lastRefresh = now;
-            needRefresh = false;
-        }
     }
 
     g_active.store(false);
@@ -563,7 +952,7 @@ static DWORD WINAPI RelayThread(void*)
 }
 
 // ------------------------------------------------------------
-// Sterowanie silnikiem (wolane pod g_ctlCs)
+// Konfiguracja i sterowanie silnikiem (wolane pod g_ctlCs)
 // ------------------------------------------------------------
 static bool ReadFileUtf8(const std::wstring& path, std::string& out)
 {
@@ -584,20 +973,25 @@ static bool ReadFileUtf8(const std::wstring& path, std::string& out)
 
 static void EnsureDefaultConfig()
 {
-    const std::wstring dir = NvrDataDir();
-    CreateDirectoryW(dir.c_str(), nullptr);
+    CreateDirectoryW(NvrDataDir().c_str(), nullptr);
 
     const std::wstring path = NvrConfigPath();
     if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
         return;
 
     static const char sample[] =
-        "# NetVarRepeater - konfiguracja\r\n"
-        "# Format: ip_nadawcy port_odbiorczy ip_docelowy port_docelowy\r\n"
-        "# ip_nadawcy 0.0.0.0 = dowolny nadawca (rowniez broadcast)\r\n"
-        "# ip_docelowy moze byc broadcast (255.255.255.255 lub np. 192.168.1.255)\r\n"
+        "# NetVar repeater - konfiguracja\r\n"
+        "# Format reguły: ip_nadawcy port_odbiorczy ip_docelowy port_docelowy\r\n"
+        "# ip_nadawcy 0.0.0.0 = dowolny nadawca (również broadcast)\r\n"
+        "# ip_docelowy może być broadcast (255.255.255.255 lub np. 192.168.1.255)\r\n"
         "# Komentarze: # lub ;\r\n"
         "#\r\n"
+        "# Ustawienia:\r\n"
+        "exclude_virtual = yes   # pomijaj karty wirtualne (VMware, VirtualBox, Hyper-V, VPN...)\r\n"
+        "max_pps = 2000          # limit pakietów/s na regułę (ochrona przed pętlą), 0 = bez limitu\r\n"
+        "log_max_kb = 512        # maks. rozmiar pliku logu w KB\r\n"
+        "#\r\n"
+        "# Przykłady reguł:\r\n"
         "# 0.0.0.0   1202 192.168.1.10   1203\r\n"
         "# 10.0.0.1  1203 192.170.10.3   1203\r\n"
         "# 0.0.0.0   1202 192.170.10.4   1202\r\n"
@@ -622,7 +1016,9 @@ static void EngineStop()
         if (g_divert != INVALID_HANDLE_VALUE && g_wdShutdown)
             g_wdShutdown(g_divert, WD_SHUTDOWN_RECV);
 
-        WaitForSingleObject(g_relayThread, 10000);
+        if (WaitForSingleObject(g_relayThread, 10000) == WAIT_TIMEOUT)
+            Log("OSTRZEŻENIE: wątek odbiorczy nie zakończył się w 10 s");
+
         CloseHandle(g_relayThread);
         g_relayThread = nullptr;
     }
@@ -651,6 +1047,10 @@ static void LoadRules(bool keepCounters)
     if (haveFile)
         cfg = NvrParseConfig(text, NVR_MAX_RULES);
 
+    g_excludeVirtual.store(cfg.settings.excludeVirtual);
+    g_maxPps.store(cfg.settings.maxPps);
+    g_logMaxKb.store(cfg.settings.logMaxKb);
+
     RuleList fresh;
     for (size_t i = 0; i < cfg.rules.size(); ++i)
     {
@@ -664,11 +1064,15 @@ static void LoadRules(bool keepCounters)
                 if (o.srcIp == r->cfg.srcIp && o.listenPort == r->cfg.listenPort &&
                     o.dstIp == r->cfg.dstIp && o.dstPort == r->cfg.dstPort)
                 {
-                    r->received.store(g_rules[j]->received.load());
-                    r->forwarded.store(g_rules[j]->forwarded.load());
-                    r->bytes.store(g_rules[j]->bytes.load());
-                    r->errors.store(g_rules[j]->errors.load());
-                    r->lastError.store(g_rules[j]->lastError.load());
+                    const Rule& old = *g_rules[j];
+                    r->received.store(old.received.load());
+                    r->forwarded.store(old.forwarded.load());
+                    r->errors.store(old.errors.load());
+                    r->skipped.store(old.skipped.load());
+                    r->bytesRx.store(old.bytesRx.load());
+                    r->bytesTx.store(old.bytesTx.load());
+                    r->lastError.store(old.lastError.load());
+                    r->lastRxIf.store(old.lastRxIf.load());
                     break;
                 }
             }
@@ -679,9 +1083,11 @@ static void LoadRules(bool keepCounters)
 
     std::string msg;
     if (!haveFile)
-        msg = "Nie mozna odczytac pliku konfiguracji";
+        msg = "Nie można odczytać pliku konfiguracji";
     else if (!cfg.errors.empty())
         msg = cfg.errors[0];
+    else if (cfg.rules.empty())
+        msg = "Brak reguł w konfiguracji - edytuj konfigurację";
 
     EnterCriticalSection(&g_dataCs);
     g_rules.swap(fresh);                       // stare reguly zamkna gniazda w destruktorach
@@ -693,7 +1099,15 @@ static void LoadRules(bool keepCounters)
     {
         g_totalSeen.store(0);
         g_totalIgnored.store(0);
+        g_totalLoop.store(0);
     }
+
+    Log("Konfiguracja: %u reguł, %u błędnych linii, exclude_virtual=%s, max_pps=%u, log_max_kb=%u",
+        static_cast<unsigned>(cfg.rules.size()), static_cast<unsigned>(cfg.errors.size()),
+        cfg.settings.excludeVirtual ? "yes" : "no", cfg.settings.maxPps, cfg.settings.logMaxKb);
+
+    for (size_t i = 0; i < cfg.errors.size() && i < 20; ++i)
+        Log("  odrzucono: %s", cfg.errors[i].c_str());
 }
 
 static std::string BuildFilter()
@@ -729,8 +1143,8 @@ static DWORD EngineStart(bool keepCounters)
 
     if (g_rules.empty())
     {
-        g_lastError.store(ERROR_BAD_CONFIGURATION);
-        return ERROR_BAD_CONFIGURATION;
+        g_lastError.store(NVR_ERR_NO_RULES);
+        return NVR_ERR_NO_RULES;
     }
 
     if (!LoadWinDivert())
@@ -743,10 +1157,15 @@ static DWORD EngineStart(bool keepCounters)
     {
         const DWORD e = GetLastError();
         g_lastError.store(e);
+        const std::string hint = ErrHint(e);
+        Log("BŁĄD: WinDivertOpen nie powiódł się: %s%s%s", ErrStr(e).c_str(),
+            hint.empty() ? "" : " - ", hint.c_str());
         return e;
     }
 
-    RefreshOutputs();
+    Log("WinDivert otwarty, filtr: %s", filter.c_str());
+
+    ApplyInterfaces(EnumInterfaces(), true);
 
     g_relayStop.store(false);
     g_lastError.store(0);
@@ -762,10 +1181,12 @@ static DWORD EngineStart(bool keepCounters)
     {
         const DWORD e = GetLastError();
         g_lastError.store(e);
+        Log("BŁĄD: nie można utworzyć wątku odbiorczego: %s", ErrStr(e).c_str());
         EngineStop();
         return e;
     }
 
+    Log("Przekazywanie URUCHOMIONE");
     return NO_ERROR;
 }
 
@@ -778,20 +1199,28 @@ static DWORD EngineCommand(uint32_t cmd)
     switch (cmd)
     {
         case NVR_CMD_START:
+            Log("Polecenie: START");
+            g_userStopped.store(false);
+            g_nextRetryTick.store(0);
             result = EngineStart(true);
             break;
 
         case NVR_CMD_STOP:
+            Log("Polecenie: STOP");
+            g_userStopped.store(true);
             EngineStop();
+            Log("Przekazywanie ZATRZYMANE");
             break;
 
         case NVR_CMD_RESET:
         {
-            const bool wasActive = g_active.load();
+            Log("Polecenie: RESET");
+            const bool shouldRun = g_active.load() || !g_userStopped.load();
             EngineStop();
             g_lastError.store(0);
+            g_nextRetryTick.store(0);
 
-            if (wasActive)
+            if (shouldRun)
             {
                 result = EngineStart(false);
             }
@@ -814,7 +1243,71 @@ static DWORD EngineCommand(uint32_t cmd)
 }
 
 // ------------------------------------------------------------
-// Serwer named pipe (tray <-> usluga)
+// Nadzor: ponawianie startu po bledzie (wycofanie 5-10-20-30-60 s)
+// ------------------------------------------------------------
+static DWORD WINAPI SupervisorThread(void*)
+{
+    unsigned failures = 0;
+    DWORD lastLoggedErr = 0xFFFFFFFFu;
+    ULONGLONG lastLoggedTick = 0;
+
+    while (WaitForSingleObject(g_stopEvent, 1000) == WAIT_TIMEOUT)
+    {
+        if (g_active.load() || g_userStopped.load())
+        {
+            failures = 0;
+            g_nextRetryTick.store(0);
+            continue;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        uint64_t next = g_nextRetryTick.load();
+
+        if (next == 0)
+        {
+            static const unsigned delays[] = { 5, 10, 20, 30, 60 };
+            const unsigned d = delays[failures < 5 ? failures : 4];
+            next = now + static_cast<ULONGLONG>(d) * 1000ull;
+            g_nextRetryTick.store(next);
+            continue;
+        }
+
+        if (now < next)
+            continue;
+
+        if (!TryEnterCriticalSection(&g_ctlCs))
+            continue;
+
+        if (!g_active.load() && !g_userStopped.load())
+        {
+            const DWORD e = EngineStart(true);
+            if (e == NO_ERROR)
+            {
+                Log("Automatyczne ponowienie startu: sukces");
+                failures = 0;
+            }
+            else
+            {
+                ++failures;
+                if (e != lastLoggedErr || now - lastLoggedTick > 600000ull)
+                {
+                    Log("Automatyczne ponowienie startu nie powiodło się: %s (kolejna próba wg harmonogramu)",
+                        ErrStr(e).c_str());
+                    lastLoggedErr = e;
+                    lastLoggedTick = now;
+                }
+            }
+        }
+
+        LeaveCriticalSection(&g_ctlCs);
+        g_nextRetryTick.store(0);
+    }
+
+    return 0;
+}
+
+// ------------------------------------------------------------
+// Serwer named pipe (tray <-> usluga), 3 watki
 // ------------------------------------------------------------
 // Uzupelnia opis interfejsu z tabeli g_ifTable (wolac pod g_dataCs).
 static void FillIf(NvrIfInfo& out, uint32_t ifIdx)
@@ -831,6 +1324,7 @@ static void FillIf(NvrIfInfo& out, uint32_t ifIdx)
             continue;
 
         out.ip = g_ifTable[i].ip;
+        out.flags = g_ifTable[i].isVirtual ? NVR_IF_VIRTUAL : 0;
         const size_t n = g_ifTable[i].name.size() < 39 ? g_ifTable[i].name.size() : 39;
         for (size_t k = 0; k < n; ++k)
             out.name[k] = g_ifTable[i].name[k];
@@ -840,55 +1334,68 @@ static void FillIf(NvrIfInfo& out, uint32_t ifIdx)
 
 static uint32_t BuildReply(std::vector<unsigned char>& out, DWORD commandResult)
 {
-    out.assign(NVR_MAX_REPLY, 0);
+    EnterCriticalSection(&g_dataCs);
+
+    size_t n = g_rules.size();
+    if (n > NVR_MAX_RULES) n = NVR_MAX_RULES;
+
+    const uint32_t size = static_cast<uint32_t>(sizeof(NvrReplyHeader) + n * sizeof(NvrRuleStatus));
+    out.assign(size, 0);
 
     NvrReplyHeader* h = reinterpret_cast<NvrReplyHeader*>(out.data());
     h->magic = NVR_MAGIC;
     h->commandResult = commandResult;
     h->active = g_active.load() ? 1u : 0u;
     h->lastError = g_lastError.load();
+    h->userStopped = g_userStopped.load() ? 1u : 0u;
+    h->excludeVirtual = g_excludeVirtual.load() ? 1u : 0u;
+    h->maxPps = g_maxPps.load();
+    h->logMaxKb = g_logMaxKb.load();
     h->nowTime = NowFileTime();
     h->totalSeen = g_totalSeen.load();
     h->totalIgnored = g_totalIgnored.load();
-
-    EnterCriticalSection(&g_dataCs);
-
+    h->totalLoopDropped = g_totalLoop.load();
     h->configErrorCount = g_cfgErrorCount;
     h->startTime = g_startTime;
+    h->ruleCount = static_cast<uint32_t>(n);
     std::strncpy(h->message, g_cfgMessage.c_str(), sizeof(h->message) - 1);
 
-    NvrRuleStatus* rs = reinterpret_cast<NvrRuleStatus*>(out.data() + sizeof(NvrReplyHeader));
-    uint32_t n = 0;
+    const uint64_t next = g_nextRetryTick.load();
+    const ULONGLONG now = GetTickCount64();
+    if (!h->active && !h->userStopped && next > now)
+        h->retryInSec = static_cast<uint32_t>((next - now + 999) / 1000);
 
-    for (size_t i = 0; i < g_rules.size() && n < NVR_MAX_RULES; ++i, ++n)
+    NvrRuleStatus* rs = reinterpret_cast<NvrRuleStatus*>(out.data() + sizeof(NvrReplyHeader));
+
+    for (size_t i = 0; i < n; ++i)
     {
         const Rule& r = *g_rules[i];
-        rs[n].srcIp = r.cfg.srcIp;
-        rs[n].dstIp = r.cfg.dstIp;
-        rs[n].listenPort = r.cfg.listenPort;
-        rs[n].dstPort = r.cfg.dstPort;
-        rs[n].outMode = r.outMode.load();
-        rs[n].outIfIdx = r.outIfIdx.load();
-        rs[n].outCount = r.outCount.load();
-        rs[n].lastError = r.lastError.load();
-        rs[n].received = r.received.load();
-        rs[n].forwarded = r.forwarded.load();
-        rs[n].bytesForwarded = r.bytes.load();
-        rs[n].errors = r.errors.load();
+        rs[i].srcIp = r.cfg.srcIp;
+        rs[i].dstIp = r.cfg.dstIp;
+        rs[i].listenPort = r.cfg.listenPort;
+        rs[i].dstPort = r.cfg.dstPort;
+        rs[i].outMode = r.outMode.load();
+        rs[i].outIfIdx = r.outIfIdx.load();
+        rs[i].outCount = r.outCount.load();
+        rs[i].lastError = r.lastError.load();
+        rs[i].received = r.received.load();
+        rs[i].forwarded = r.forwarded.load();
+        rs[i].errors = r.errors.load();
+        rs[i].skipped = r.skipped.load();
+        rs[i].bytesReceived = r.bytesRx.load();
+        rs[i].bytesForwarded = r.bytesTx.load();
 
-        FillIf(rs[n].rxIf, r.lastRxIf.load());
+        FillIf(rs[i].rxIf, r.lastRxIf.load());
 
         uint32_t shown = r.outCount.load();
         if (shown > NVR_MAX_TX_SHOW) shown = NVR_MAX_TX_SHOW;
-        rs[n].txShown = shown;
+        rs[i].txShown = shown;
         for (uint32_t k = 0; k < shown; ++k)
-            FillIf(rs[n].txIf[k], r.txIf[k].load());
+            FillIf(rs[i].txIf[k], r.txIf[k].load());
     }
 
     LeaveCriticalSection(&g_dataCs);
-
-    h->ruleCount = n;
-    return static_cast<uint32_t>(sizeof(NvrReplyHeader) + n * sizeof(NvrRuleStatus));
+    return size;
 }
 
 // Czeka na zakonczenie operacji overlapped; false przy timeout/stop/bledzie.
@@ -916,7 +1423,7 @@ static DWORD WINAPI PipeThread(void*)
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             L"D:(A;;GRGW;;;AU)(A;;GA;;;BA)(A;;GA;;;SY)", SDDL_REVISION_1, &sd, nullptr))
     {
-        g_lastError.store(GetLastError());
+        Log("BŁĄD: nie można utworzyć deskryptora zabezpieczeń pipe: %s", ErrStr(GetLastError()).c_str());
         return 1;
     }
 
@@ -1008,7 +1515,7 @@ static DWORD WINAPI PipeThread(void*)
 }
 
 // ------------------------------------------------------------
-// Usluga Windows
+// Wspolny rdzen: tryb uslugi i tryb konsolowy
 // ------------------------------------------------------------
 static void ReportServiceStatus(DWORD state, DWORD exitCode = NO_ERROR, DWORD waitHint = 0)
 {
@@ -1034,13 +1541,97 @@ static void ReportServiceStatus(DWORD state, DWORD exitCode = NO_ERROR, DWORD wa
     SetServiceStatus(g_statusHandle, &g_serviceStatus);
 }
 
+static int RunCore(bool console)
+{
+    InitializeCriticalSection(&g_logCs);
+    InitializeCriticalSection(&g_dataCs);
+    InitializeCriticalSection(&g_ctlCs);
+
+    g_console = console;
+    CreateDirectoryW(NvrDataDir().c_str(), nullptr);
+    SetCurrentDirectoryW(ExeDir().c_str());   // katalog roboczy uslugi to System32
+
+    Log("=== NetVar repeater: start (%s) ===", console ? "tryb konsolowy" : "usługa");
+
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+    WSADATA wsa;
+    const int wsaRc = WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    if (!g_stopEvent || wsaRc != 0)
+    {
+        Log("BŁĄD: inicjalizacja (WSAStartup=%d)", wsaRc);
+        return 1;
+    }
+
+    for (int i = 0; i < NUM_PIPE_THREADS; ++i)
+        g_pipeThreads[i] = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr);
+
+    g_supervisor = CreateThread(nullptr, 0, SupervisorThread, nullptr, 0, nullptr);
+
+    ReportServiceStatus(SERVICE_RUNNING);
+
+    // Automatyczny start przekazywania. Przy bledzie usluga dziala dalej
+    // i SupervisorThread ponawia probe (wynik widoczny w trayu i w logu).
+    EnterCriticalSection(&g_ctlCs);
+    const DWORD startResult = EngineStart(false);
+    LeaveCriticalSection(&g_ctlCs);
+
+    if (startResult != NO_ERROR)
+        Log("Start nieudany (%s) - usługa próbuje ponownie automatycznie", ErrStr(startResult).c_str());
+
+    WaitForSingleObject(g_stopEvent, INFINITE);
+
+    Log("Zatrzymywanie...");
+
+    for (int i = 0; i < NUM_PIPE_THREADS; ++i)
+    {
+        if (g_pipeThreads[i])
+        {
+            WaitForSingleObject(g_pipeThreads[i], 5000);
+            CloseHandle(g_pipeThreads[i]);
+            g_pipeThreads[i] = nullptr;
+        }
+    }
+
+    if (g_supervisor)
+    {
+        WaitForSingleObject(g_supervisor, 15000);
+        CloseHandle(g_supervisor);
+        g_supervisor = nullptr;
+    }
+
+    EnterCriticalSection(&g_ctlCs);
+    EngineStop();
+    LeaveCriticalSection(&g_ctlCs);
+
+    g_rules.clear();
+
+    if (g_dll)
+    {
+        FreeLibrary(g_dll);
+        g_dll = nullptr;
+    }
+
+    WSACleanup();
+    CloseHandle(g_stopEvent);
+    g_stopEvent = nullptr;
+
+    Log("=== NetVar repeater: zatrzymany ===");
+
+    DeleteCriticalSection(&g_ctlCs);
+    DeleteCriticalSection(&g_dataCs);
+    DeleteCriticalSection(&g_logCs);
+    return 0;
+}
+
 static DWORD WINAPI ServiceHandler(DWORD control, DWORD, void*, void*)
 {
     switch (control)
     {
         case SERVICE_CONTROL_STOP:
         case SERVICE_CONTROL_SHUTDOWN:
-            ReportServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 15000);
+            ReportServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 30000);
             if (g_stopEvent)
                 SetEvent(g_stopEvent);
             return NO_ERROR;
@@ -1062,65 +1653,53 @@ static void WINAPI ServiceMain(DWORD, LPWSTR*)
     std::memset(&g_serviceStatus, 0, sizeof(g_serviceStatus));
     ReportServiceStatus(SERVICE_START_PENDING, NO_ERROR, 10000);
 
-    // katalog roboczy uslugi to System32 - przenosimy do katalogu exe
-    SetCurrentDirectoryW(ExeDir().c_str());
+    const int rc = RunCore(false);
 
-    InitializeCriticalSection(&g_dataCs);
-    InitializeCriticalSection(&g_ctlCs);
-
-    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-
-    WSADATA wsa;
-    const int wsaRc = WSAStartup(MAKEWORD(2, 2), &wsa);
-
-    if (!g_stopEvent || wsaRc != 0)
-    {
-        ReportServiceStatus(SERVICE_STOPPED, wsaRc ? static_cast<DWORD>(wsaRc) : GetLastError());
-        return;
-    }
-
-    g_pipeThread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr);
-
-    ReportServiceStatus(SERVICE_RUNNING);
-
-    // Automatyczny start przekazywania (wynik widoczny w trayu; usluga dziala dalej nawet przy bledzie)
-    EnterCriticalSection(&g_ctlCs);
-    EngineStart(false);
-    LeaveCriticalSection(&g_ctlCs);
-
-    WaitForSingleObject(g_stopEvent, INFINITE);
-
-    if (g_pipeThread)
-    {
-        WaitForSingleObject(g_pipeThread, 5000);
-        CloseHandle(g_pipeThread);
-        g_pipeThread = nullptr;
-    }
-
-    EnterCriticalSection(&g_ctlCs);
-    EngineStop();
-    LeaveCriticalSection(&g_ctlCs);
-
-    g_rules.clear();
-
-    if (g_dll)
-    {
-        FreeLibrary(g_dll);
-        g_dll = nullptr;
-    }
-
-    WSACleanup();
-    CloseHandle(g_stopEvent);
-    g_stopEvent = nullptr;
-
-    DeleteCriticalSection(&g_dataCs);
-    DeleteCriticalSection(&g_ctlCs);
-
-    ReportServiceStatus(SERVICE_STOPPED);
+    ReportServiceStatus(SERVICE_STOPPED, rc == 0 ? NO_ERROR : ERROR_SERVICE_SPECIFIC_ERROR);
 }
 
-int main()
+static BOOL WINAPI ConsoleHandler(DWORD type)
 {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT ||
+        type == CTRL_SHUTDOWN_EVENT)
+    {
+        if (g_stopEvent)
+            SetEvent(g_stopEvent);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static bool PipeAlreadyExists()
+{
+    if (WaitNamedPipeW(NVR_PIPE_NAME, 1))
+        return true;
+    return GetLastError() != ERROR_FILE_NOT_FOUND;
+}
+
+int main(int argc, char** argv)
+{
+    bool console = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--console") == 0 || std::strcmp(argv[i], "-c") == 0)
+            console = true;
+
+    if (console)
+    {
+        SetConsoleOutputCP(CP_UTF8);
+
+        if (PipeAlreadyExists())
+        {
+            std::fputs("Usługa NetVarRepeater (lub inna instancja) już działa.\n"
+                       "Zatrzymaj ją (sc stop NetVarRepeater) przed uruchomieniem w trybie konsolowym.\n", stderr);
+            return 2;
+        }
+
+        SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+        std::puts("NetVar repeater - tryb konsolowy (Ctrl+C = zakończ). Wymaga uprawnień administratora.");
+        return RunCore(true);
+    }
+
     SERVICE_TABLE_ENTRYW table[] =
     {
         { const_cast<LPWSTR>(NVR_SERVICE_NAME), ServiceMain },
@@ -1129,9 +1708,12 @@ int main()
 
     if (!StartServiceCtrlDispatcherW(table))
     {
-        MessageBoxW(nullptr,
-                    L"Ten program jest uslugą Windows. Zainstaluj ją przez install.bat.",
-                    L"NetVarRepeaterService", MB_OK | MB_ICONINFORMATION);
+        if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
+        {
+            std::puts("NetVarRepeaterService.exe jest usługą Windows.\n"
+                      "  Instalacja:        install.bat (jako administrator)\n"
+                      "  Test w konsoli:    NetVarRepeaterService.exe --console");
+        }
         return 1;
     }
 
