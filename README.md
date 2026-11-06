@@ -9,7 +9,8 @@ Program dla Windows 10/11 (x64), który **kopiuje odebrane datagramy UDP** z wyb
 | `service.cpp` | Usługa Windows: przechwytywanie (WinDivert), przekazywanie, liczniki, log, nadzór, serwer named pipe; tryb konsolowy `--console` |
 | `tray.cpp` | Ikona w zasobniku: okienko przy najechaniu, okno statusu, menu, edytor konfiguracji |
 | `common.h` | Protokół usługa ↔ tray, ścieżki plików |
-| `config.h` | Parser `config.txt` (reguły i ustawienia) |
+| `config.h` | Parsery `config.txt` (reguły) i `settings.ini` (karty, log, limit pps) |
+| `adapters.h` | Wspólna enumeracja kart sieciowych (usługa i okno konfiguracji) |
 | `NetVarRepeater.cbp` | Projekt Code::Blocks (targety `Service`, `Tray`) – wyniki i pliki `.o` trafiają do tego samego katalogu |
 | `install.bat` / `uninstall.bat` | Instalacja / usunięcie usługi i autostartu ikony |
 | `README.md` | Ta dokumentacja |
@@ -22,9 +23,10 @@ Po kompilacji w tym samym katalogu powstają `NetVarRepeaterService.exe` i `NetV
 - `ip_nadawcy = 0.0.0.0` = **dowolny nadawca** (także broadcast). Cel może być broadcastem ograniczonym (`255.255.255.255`) lub kierowanym (np. `192.168.1.255`).
 - **Port nie jest blokowany**: WinDivert w trybie `SNIFF` (kopia pakietu), brak `bind()` na porcie odbiorczym.
 - Automatyczny start z systemem; **ponawianie startu po błędzie** (WinDivert niezaładowany, brak reguł, brak sieci...) z narastającym odstępem 5 → 10 → 20 → 30 → 60 s. Nie dotyczy stanu „zatrzymany przez użytkownika”. Usługa restartuje się też po awarii procesu (ustawienia SCM).
-- **Pomijanie kart wirtualnych** (domyślnie włączone, `exclude_virtual = yes`): VMware, VirtualBox, Hyper-V/vEthernet, WSL, Docker, VPN/TAP/WireGuard/Tailscale/ZeroTier, Bluetooth PAN, tunele (Teredo, ISATAP, 6to4) i każda karta o typie innym niż Ethernet/Wi-Fi/WWAN. Rozpoznanie: typ interfejsu, prefiks MAC (VMware, VirtualBox, Hyper-V, Parallels, Xen, QEMU) oraz nazwa/opis. Pominięte karty nie są używane do wysyłania ani odbioru.
-- **Log** `C:\ProgramData\NetVarRepeater\netvarrepeater.log` z rotacją: po przekroczeniu `log_max_kb` plik jest przenoszony do `.log.1` (nadpisując poprzedni), więc zajęcie dysku to najwyżej ok. 2 × `log_max_kb`. Zapisywane są: start/stop, konfiguracja i odrzucone linie, lista kart i wybrane wyjścia, błędy WinDivert i wysyłki (ograniczone do 1 wpisu/min na regułę), ostrzeżenia o limicie pakietów.
-- **Ochrona przed pętlą**: (1) odrzucanie pakietów, których nadawcą jest własny adres, (2) filtr `loopback == 0` i tylko ruch przychodzący, (3) brak odsyłania broadcastu na kartę odbiorczą, (4) pominięcie broadcastu kierowanego na tę samą sieć i ten sam port (ping-pong z drugim repeaterem), (5) limit `max_pps` pakietów/s na regułę (domyślnie 2000, `0` = bez limitu).
+- **Wybór kart sieciowych w oknie konfiguracji** (zakładka *Karty sieciowe*): tabela wszystkich kart z polami ☑/☐ **Odbiór** i **Wysyłanie** osobno dla każdej karty. Karta bez zapisanego wyboru (np. nowa) dostaje wartość domyślną: **fizyczna = włączona, wirtualna = wyłączona** (VMware, VirtualBox, Hyper-V/vEthernet, WSL, Docker, VPN/TAP/WireGuard, Bluetooth PAN, tunele – rozpoznanie po typie interfejsu, prefiksie MAC i nazwie/opisie). Wybór użytkownika zawsze ma pierwszeństwo nad heurystyką. Karty zapisane, ale chwilowo odłączone, pozostają na liście (stan „nieobecna”) i można je ustawić z góry. Karta jest identyfikowana po GUID, a nie po zmiennym indeksie.
+- Jeśli trasa do celu prowadzi przez kartę z **wyłączonym wysyłaniem**, pakiet jest odrzucany i liczony jako błąd z czytelnym komunikatem (zamiast cichego wycieku przez wyłączoną kartę). Przy braku trasy (błąd `GetBestInterfaceEx`) o wyjściu decyduje system.
+- **Log** `C:\ProgramData\NetVarRepeater\netvarrepeater.log` z rotacją: limit w **MB (liczba całkowita ≥ 1, domyślnie 1)** ustawiasz w oknie konfiguracji (zakładka *Ustawienia*). Po przekroczeniu limitu plik jest przenoszony do `.log.1` (nadpisując poprzedni), więc zajęcie dysku to najwyżej ok. 2 × limit. Log otworzysz z menu ikony (*Otwórz log*, *Otwórz folder logu*) lub przyciskiem w zakładce *Ustawienia*. Zapisywane są: start/stop, konfiguracja i odrzucone linie, lista kart i wybrane wyjścia, błędy WinDivert i wysyłki (ograniczone do 1 wpisu/min na regułę), ostrzeżenia o limicie pakietów.
+- **Ochrona przed pętlą**: (1) odrzucanie pakietów, których nadawcą jest własny adres, (2) filtr `loopback == 0` i tylko ruch przychodzący, (3) brak odsyłania broadcastu na kartę odbiorczą, (4) pominięcie broadcastu kierowanego na tę samą sieć i ten sam port (ping-pong z drugim repeaterem), (5) limit pakietów/s na regułę (zakładka *Ustawienia*, domyślnie 2000, `0` = bez limitu).
 - **Tryb konsolowy**: `NetVarRepeaterService.exe --console` – ten sam kod w oknie konsoli, log na ekranie, Ctrl+C kończy. Wymaga administratora; odmawia startu, gdy zainstalowana usługa już działa. Target `Service` w Code::Blocks ma ten parametr ustawiony.
 
 ### Ikona, okienka i menu
@@ -32,31 +34,41 @@ Po kompilacji w tym samym katalogu powstają `NetVarRepeaterService.exe` i `NetV
 - Ikona ma napis „NV” (na 16×16 pełna nazwa się nie mieści), pełne „NetVar repeater” jest w tooltipie i tytułach okien. Kolor: szary – usługa niedostępna, pomarańczowy – zatrzymany / nie działa, zielony – aktywny, czerwony – aktywny z błędami wysyłania.
 - **Najechanie**: zwarte okienko – stan, start, czas pracy, błędy, liczniki ogólne i po dwie linie na regułę (liczniki + karta odbiorcza → karty wysyłające z adresami IP).
 - **Kliknięcie ikony**: okno statusu (tabela wszystkich reguł: odebrane, przekazane, błędy, pominięte, dane odebrane/wysłane, karta odbiorcza i wysyłająca z IP i indeksem) z przyciskami Start/Stop/Reset/Edytuj. Odświeża się co 2 s bez migotania.
-- **Prawy przycisk**: status, lista reguł (kliknięcie otwiera edytor), `Edytuj konfigurację...`, **Start** (wczytuje konfigurację), **Stop**, **Reset** (wczytuje konfigurację i zeruje liczniki; stan Start/Stop bez zmian), `Zamknij ikonę`.
+- **Prawy przycisk**: status, lista reguł (kliknięcie otwiera edytor), `Edytuj konfigurację (reguły, karty, ustawienia)...`, `Otwórz log`, `Otwórz folder logu`, **Start** (wczytuje konfigurację), **Stop**, **Reset** (wczytuje konfigurację i zeruje liczniki; stan Start/Stop bez zmian), `Zamknij ikonę`.
 - Polecenia wykonują się w tle – okna się nie blokują, a status jest dostępny także podczas Start/Reset (usługa obsługuje pipe w 3 wątkach). Chwilowe braki odpowiedzi nie zmieniają ikony na szarą (dopiero 3 kolejne).
-- **Edytor konfiguracji**: Ctrl+A, Ctrl+S, Esc, Ctrl+Tab (do przycisków), na bieżąco liczy reguły i błędy, pokazuje wiersz/kolumnę, przycisk *Następny błąd* skacze do błędnej linii, pyta o zapis przy zamykaniu. *Zapisz i zastosuj* zapisuje i wysyła Start.
+- **Okno konfiguracji** (trzy zakładki):
+  - *Reguły* – edytor tekstu: Ctrl+A, Ctrl+S, Esc, Ctrl+Tab (do przycisków), bieżąca walidacja (liczba reguł i błędów, wiersz/kolumna), przycisk *Następny błąd*,
+  - *Karty sieciowe* – tabela kart (nazwa, adres IPv4, stan, typ, GUID) z polami Odbiór / Wysyłanie; klik w ☑/☐, klawisze Spacja/R (odbiór) i W (wysyłanie) albo przyciski; *Domyślne (fizyczne)* przywraca wartości z heurystyki, *Odśwież listę* wczytuje karty ponownie,
+  - *Ustawienia* – maksymalny rozmiar logu w MB, limit pakietów/s, przycisk *Otwórz log*.
+  *Zapisz* zapisuje `config.txt` i `settings.ini` (po walidacji; ostrzega, gdy żadna karta nie ma odbioru lub wysyłania), *Zapisz i zastosuj* dodatkowo wysyła Start. Przy zamykaniu pyta o niezapisane zmiany.
 - **Ikona nie ma trafiać do ukrytych**: Windows 11 domyślnie chowa nowe ikony. Tray ustawia w `HKCU\Control Panel\NotifyIconSettings\<id>` wartość `IsPromoted = 1` dla własnego pliku exe (kilka prób po starcie, bo wpis tworzy Explorer). To mechanizm nieudokumentowany przez Microsoft – na Windows 10 klucz nie istnieje i ikona jest widoczna, jeśli użytkownik jej sam nie ukryje. Jeśli ręcznie przeniesiesz ikonę do ukrytych, przy następnym starcie tray zostanie przypięta ponownie.
 
 ## Konfiguracja
 
-Plik: `C:\ProgramData\NetVarRepeater\config.txt` (tworzony z komentowanym przykładem przy pierwszym starcie; zapisany w UTF-8).
+**Reguły** – `C:\ProgramData\NetVarRepeater\config.txt` (tworzony z komentowanym przykładem przy pierwszym starcie, UTF-8):
 
 ```
-# ustawienia
-exclude_virtual = yes
-max_pps = 2000
-log_max_kb = 512
-
-# reguły: ip_nadawcy port_odbiorczy ip_docelowy port_docelowy
+# ip_nadawcy  port_odbiorczy  ip_docelowy  port_docelowy
 0.0.0.0    1202  192.168.1.10     1203
 10.0.0.1   1203  192.170.10.3     1203
 0.0.0.0    1202  192.170.10.4     1202
 10.0.0.1   1203  255.255.255.255  1203
 ```
 
-- Separatory reguł: spacje, tabulatory lub przecinki. Komentarze: `#` lub `;`. Ustawienia: `klucz = wartość` (`exclude_virtual`: yes/no/tak/nie/true/false/1/0; `max_pps`: 0–1000000; `log_max_kb`: 16–102400).
-- Błędne linie (zły adres/port, nie 4 pola, duplikat, nieznane ustawienie) są pomijane i widoczne w statusie, edytorze i logu. Brak poprawnych reguł = usługa nie przekazuje i ponawia próbę (można poprawić plik bez klikania Start).
-- Zmiany działają po **Start** lub **Reset** (albo po automatycznym ponowieniu startu).
+- Separatory: spacje, tabulatory lub przecinki. Komentarze: `#` lub `;`.
+- Błędne linie (zły adres/port, nie 4 pola, duplikat) są pomijane i widoczne w statusie, edytorze i logu.
+- Brak poprawnych reguł = usługa nie przekazuje i ponawia próbę (można poprawić plik bez klikania Start).
+- Dawne ustawienia `exclude_virtual`, `max_pps`, `log_max_kb` **nie są już czytane z `config.txt`** – linia z takim kluczem jest zgłaszana jako błąd z prośbą o usunięcie; ustawienia są teraz w oknie konfiguracji.
+
+**Ustawienia** – `C:\ProgramData\NetVarRepeater\settings.ini`, zarządzany przez okno konfiguracji (nie trzeba go edytować ręcznie):
+
+```
+log_max_mb = 1
+max_pps = 2000
+adapter = {GUID}|odbior|wysylanie|nazwa      # po jednej linii na kartę, 1 = włączone, 0 = wyłączone
+```
+
+Brak pliku = ustawienia domyślne (log 1 MB, 2000 pakietów/s, karty fizyczne włączone, wirtualne wyłączone). Zmiany działają po **Start** lub **Reset**.
 
 ## Liczniki
 
@@ -68,20 +80,21 @@ Na regułę obowiązuje zależność **odebrane = przekazane + błędy + pomini�
 - *pominięte* – celowo nie wysłane (limit `max_pps`, ochrona przed pętlą),
 - *dane odebrane/wysłane* – suma bajtów payloadu; wysłane liczone po każdym wyjściu, więc broadcast na dwie karty daje dwukrotność.
 
-Liczniki ogólne: *przechwycone* (przez filtr WinDivert), *bez reguły* (uszkodzone, sfragmentowane, bez pasującej reguły), *pętla/wirtualne* (pakiety z własnego adresu i z kart wirtualnych).
+Liczniki ogólne: *przechwycone* (przez filtr WinDivert), *bez reguły* (uszkodzone, sfragmentowane, bez pasującej reguły), *pętla / karty wyłączone* (pakiety z własnego adresu i z kart z wyłączonym odbiorem).
 
 ## Identyfikacja interfejsów sieciowych
 
-**Odbiór.** WinDivert (warstwa `NETWORK`, `SNIFF`) obejmuje wszystkie interfejsy; filtr: `inbound and loopback == 0 and ip and udp and (udp.DstPort == P1 or ...)`. Każdy pakiet ma indeks interfejsu odbiorczego (`IfIdx`), który program zapisuje w regule i dopasowuje do listy kart (nazwa, IP, flaga wirtualna). Pakiety są widziane przed zaporą, więc port nie musi być otwarty. Nadawca i port są dopasowywane w kodzie.
+**Odbiór.** WinDivert (warstwa `NETWORK`, `SNIFF`) obejmuje wszystkie interfejsy; filtr: `inbound and loopback == 0 and ip and udp and (udp.DstPort == P1 or ...)`. Każdy pakiet ma indeks interfejsu odbiorczego (`IfIdx`), który program zapisuje w regule i dopasowuje do listy kart. Pakiet z karty, na której **odbiór jest wyłączony**, jest odrzucany (liczony w „pętla / karty wyłączone”). Pakiety są widziane przed zaporą, więc port nie musi być otwarty. Nadawca i port są dopasowywane w kodzie.
 
-**Wyjście.** Lista kart (`GetAdaptersAddresses`: IPv4, stan *Up*, bez loopbacku, z prefiksem i flagą wirtualna) jest sprawdzana co 5 s i po błędzie wysyłki. **Gniazda są odtwarzane tylko wtedy, gdy lista kart faktycznie się zmieniła** (albo gdy dana reguła miała błąd wysyłki), więc port źródłowy nie zmienia się bez potrzeby. Tryb wyjścia na regułę:
+**Wyjście.** Lista kart (`GetAdaptersAddresses`: IPv4, stan *Up*, bez loopbacku, z prefiksem, GUID i wyborem Odbiór/Wysyłanie) jest sprawdzana co 5 s i po błędzie wysyłki. **Gniazda są odtwarzane tylko wtedy, gdy lista kart faktycznie się zmieniła** (albo gdy dana reguła miała błąd wysyłki), więc port źródłowy nie zmienia się bez potrzeby. Tryb wyjścia na regułę:
 
 | Adres docelowy | Wybór |
 |---|---|
-| `255.255.255.255` | po jednym gnieździe na każdą aktywną, niewykluczoną kartę, **bez karty odbiorczej** |
+| `255.255.255.255` | po jednym gnieździe na każdą aktywną kartę z włączonym wysyłaniem, **bez karty odbiorczej** |
 | broadcast kierowany, np. `192.168.1.255` | karta z tą podsiecią |
 | unicast | karta z tablicy routingu (`GetBestInterfaceEx`) |
-| inne (adres lokalny, karta wykluczona) | wybiera system |
+| trasa przez kartę z wyłączonym wysyłaniem | pakiet odrzucany (błąd) |
+| inne (adres lokalny, brak trasy) | wybiera system |
 
 Gniazdo jest przypięte do karty przez `bind()` na jej adres oraz `IP_UNICAST_IF` (działa też dla broadcastu); `SO_BROADCAST` włączone. Przekazywana jest zawartość datagramu w nowym pakiecie – adres źródłowy to adres karty wyjściowej, port efemeryczny.
 
@@ -94,7 +107,7 @@ Gniazdo jest przypięte do karty przez `bind()` na jej adres oraz `IP_UNICAST_IF
 |---|---|---|
 | Kompilator | `-std=c++17 -O2 -Wall -Wextra -Wno-cast-function-type -m64 -D_WIN32_WINNT=0x0601` | to samo + `-DUNICODE -D_UNICODE` |
 | Linker | `-static -static-libgcc -static-libstdc++ -s` | to samo + `-mwindows -municode` |
-| Biblioteki | `ws2_32 iphlpapi advapi32` | `shell32 user32 gdi32 comctl32 advapi32` |
+| Biblioteki | `ws2_32 iphlpapi advapi32` | `shell32 user32 gdi32 comctl32 iphlpapi advapi32` |
 
 WinDivert jest ładowany dynamicznie – nie trzeba go linkować.
 
@@ -122,5 +135,6 @@ Pipe: polecenia `STATUS / START / STOP / RESET`; dostęp: zalogowani użytkownic
 - Tylko IPv4; sfragmentowane datagramy IP nie są składane.
 - Pakiety nadane z tego samego komputera (loopback) nie są przekazywane.
 - Każdy zalogowany użytkownik może przez tray zmienić konfigurację i sterować usługą (działa jako SYSTEM). W środowisku wieloużytkownikowym zawęź uprawnienia katalogu `ProgramData\NetVarRepeater` i SDDL pipe'a w `service.cpp`.
-- Rozpoznawanie kart wirtualnych jest heurystyczne; nietypowa karta wirtualna bez rozpoznawalnej nazwy/MAC może zostać uznana za fizyczną (i odwrotnie). Wynik widać w logu i oknie statusu (`[wirt.]`).
+- Rozpoznawanie kart wirtualnych służy tylko do ustawienia wartości domyślnej (heurystyka); nietypowa karta może zostać źle sklasyfikowana – popraw ją w zakładce *Karty sieciowe*.
+- Duży limit logu (do 1024 MB) oznacza, że *Otwórz log* w Notatniku może być wolne – użyj wtedy *Otwórz folder logu*.
 - Pierwsze pakiety tuż po starcie systemu mogą zakończyć się błędem wysyłki, jeśli sieć nie ma jeszcze adresu IP.
