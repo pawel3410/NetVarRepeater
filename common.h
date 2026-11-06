@@ -10,12 +10,13 @@
 #define NVR_SERVICE_NAME L"NetVarRepeater"
 #define NVR_PIPE_NAME    L"\\\\.\\pipe\\NetVarRepeater"
 
-static const uint32_t NVR_MAGIC     = 0x3252564E;  // "NVR2" (zmiana wersji protokolu)
+static const uint32_t NVR_MAGIC     = 0x3352564E;  // "NVR3" (zmiana wersji protokolu)
 static const uint32_t NVR_MAX_RULES = 256;
 static const uint32_t NVR_MAX_TX_SHOW = 4;   // ile interfejsow wysylajacych raportujemy na regule
 
 // Wlasne kody bledow (bit 29 = kod klienta, nie koliduje z Win32)
 static const uint32_t NVR_ERR_NO_RULES = 0xE0000001u;   // brak poprawnych regul w konfiguracji
+static const uint32_t NVR_ERR_ADAPTER_DISABLED = 0xE0000002u;   // trasa prowadzi przez karte wylaczona w konfiguracji
 
 enum NvrCommand : uint32_t
 {
@@ -53,10 +54,10 @@ struct NvrReplyHeader
     uint32_t ruleCount;         // liczba struktur NvrRuleStatus za naglowkiem
     uint32_t userStopped;       // 1 = zatrzymane przez uzytkownika (bez auto-ponawiania)
     uint32_t retryInSec;        // za ile sekund automatyczna proba startu (0 = brak)
-    uint32_t excludeVirtual;    // ustawienie exclude_virtual
-    uint32_t maxPps;            // ustawienie max_pps
-    uint32_t logMaxKb;          // ustawienie log_max_kb
-    uint32_t reserved;
+    uint32_t reserved1;
+    uint32_t maxPps;            // ustawienie: limit pakietow/s na regule
+    uint32_t logMaxMb;          // ustawienie: maks. rozmiar logu w MB
+    uint32_t reserved2;
     uint64_t startTime;         // FILETIME UTC rozpoczecia pracy (0 = nie startowano)
     uint64_t nowTime;           // FILETIME UTC w chwili odpowiedzi
     uint64_t totalSeen;         // pakiety przechwycone przez filtr WinDivert
@@ -110,3 +111,4 @@ inline std::wstring NvrDataDir()
 
 inline std::wstring NvrConfigPath() { return NvrDataDir() + L"\\config.txt"; }
 inline std::wstring NvrLogPath()    { return NvrDataDir() + L"\\netvarrepeater.log"; }
+inline std::wstring NvrSettingsPath() { return NvrDataDir() + L"\\settings.ini"; }
