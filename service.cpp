@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "adapters.h"
 #include "common.h"
 #include "config.h"
 
@@ -40,9 +41,9 @@
 // ------------------------------------------------------------
 // Ustawienia (z config.txt) i stan globalny
 // ------------------------------------------------------------
-static std::atomic<bool>     g_excludeVirtual(true);
 static std::atomic<uint32_t> g_maxPps(2000);
-static std::atomic<uint32_t> g_logMaxKb(512);
+static std::atomic<uint32_t> g_logMaxMb(1);
+static NvrSettingsFile       g_settings;   // zmieniane tylko gdy relay stoi (LoadRules)
 
 static CRITICAL_SECTION g_logCs;    // log
 static CRITICAL_SECTION g_dataCs;   // g_rules (podmiana), g_cfgMessage, g_startTime, g_ifTable
@@ -84,6 +85,8 @@ static std::string ErrStr(DWORD code)
 {
     if (code == NVR_ERR_NO_RULES)
         return "brak poprawnych reguł w konfiguracji";
+    if (code == NVR_ERR_ADAPTER_DISABLED)
+        return "trasa prowadzi przez kartę wyłączoną w konfiguracji (zakładka Karty sieciowe)";
 
     wchar_t buf[512];
     DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -148,7 +151,7 @@ static void Log(const char* fmt, ...)
     if (h != INVALID_HANDLE_VALUE)
     {
         LARGE_INTEGER size;
-        const unsigned long long limit = static_cast<unsigned long long>(g_logMaxKb.load()) * 1024ull;
+        const unsigned long long limit = static_cast<unsigned long long>(g_logMaxMb.load()) * 1024ull * 1024ull;
 
         if (GetFileSizeEx(h, &size) && static_cast<unsigned long long>(size.QuadPart) > limit)
         {
@@ -258,6 +261,7 @@ struct Rule
     NvrRuleCfg  cfg;
     sockaddr_in dst;
     bool        directedBcast;      // adres docelowy to broadcast kierowany
+    uint32_t    noOutError;         // kod bledu, gdy regula nie ma zadnego wyjscia
     std::vector<OutSock> outs;      // tylko watek relay (lub Start/Stop gdy relay stoi)
 
     // dane tylko dla watku relay
@@ -280,7 +284,7 @@ struct Rule
     std::atomic<uint64_t> bytesTx;
 
     explicit Rule(const NvrRuleCfg& c)
-        : cfg(c), directedBcast(false), failed(false), tokens(0), tokTick(0), lastLogTick(0),
+        : cfg(c), directedBcast(false), noOutError(ERROR_NETWORK_UNREACHABLE), failed(false), tokens(0), tokTick(0), lastLogTick(0),
           outMode(NVR_OUT_OS), outIfIdx(0), outCount(0), lastRxIf(0), lastError(0),
           received(0), forwarded(0), errors(0), skipped(0), bytesRx(0), bytesTx(0)
     {
@@ -353,129 +357,38 @@ struct IfAddr
     uint32_t ifIdx;
     uint32_t ip;          // host order
     uint32_t mask;        // host order
-    bool     isVirtual;
+    bool     isVirtual;   // heurystyka (tylko informacyjnie)
+    bool     rxAllowed;   // karta zaznaczona w oknie konfiguracji: odbior
+    bool     txAllowed;   // karta zaznaczona w oknie konfiguracji: wysylanie
     std::wstring name;
 };
 
 static std::vector<IfAddr> g_ifTable;   // ostatnio wyliczone interfejsy (pod g_dataCs)
 
-static bool ContainsNoCase(const std::wstring& hay, const wchar_t* needle)
-{
-    std::wstring h = hay;
-    for (size_t i = 0; i < h.size(); ++i)
-        h[i] = static_cast<wchar_t>(std::towlower(h[i]));
-
-    std::wstring n = needle;
-    for (size_t i = 0; i < n.size(); ++i)
-        n[i] = static_cast<wchar_t>(std::towlower(n[i]));
-
-    return h.find(n) != std::wstring::npos;
-}
-
-// Karta wirtualna: typ interfejsu inny niz fizyczny (Ethernet/Wi-Fi/WWAN),
-// znany prefiks MAC (VMware, VirtualBox, Hyper-V, Parallels, QEMU, Xen)
-// lub charakterystyczna nazwa/opis (VPN, TAP, WSL, Docker, vEthernet...).
-static bool IsVirtualAdapter(const IP_ADAPTER_ADDRESSES* a)
-{
-    switch (a->IfType)
-    {
-        case 6:     // Ethernet
-        case 71:    // Wi-Fi
-        case 117:   // Gigabit Ethernet
-        case 243:   // WWAN
-        case 244:   // WWAN
-            break;
-        default:
-            return true;    // tunele, PPP, loopback, ...
-    }
-
-    if (a->PhysicalAddressLength >= 3)
-    {
-        const unsigned char* m = a->PhysicalAddress;
-        static const unsigned char oui[][3] =
-        {
-            {0x00,0x05,0x69}, {0x00,0x0C,0x29}, {0x00,0x1C,0x14}, {0x00,0x50,0x56},   // VMware
-            {0x08,0x00,0x27}, {0x0A,0x00,0x27},                                       // VirtualBox
-            {0x00,0x15,0x5D},                                                         // Hyper-V
-            {0x00,0x1C,0x42},                                                         // Parallels
-            {0x00,0x16,0x3E},                                                         // Xen
-            {0x52,0x54,0x00}                                                          // QEMU/KVM
-        };
-        for (size_t i = 0; i < sizeof(oui) / sizeof(oui[0]); ++i)
-            if (m[0] == oui[i][0] && m[1] == oui[i][1] && m[2] == oui[i][2])
-                return true;
-    }
-
-    std::wstring text;
-    if (a->Description)  text += a->Description;
-    text += L" | ";
-    if (a->FriendlyName) text += a->FriendlyName;
-
-    static const wchar_t* kw[] =
-    {
-        L"vmware", L"virtualbox", L"vbox", L"hyper-v", L"vethernet", L"virtual", L"wsl",
-        L"docker", L"tap-windows", L"tap-", L"wintun", L"wireguard", L"openvpn", L"tailscale",
-        L"zerotier", L"vpn", L"tunnel", L"loopback", L"npcap", L"parallels", L"qemu", L"xen ",
-        L"bluetooth", L"host-only", L"anyconnect", L"globalprotect", L"fortinet", L"teredo",
-        L"isatap", L"6to4"
-    };
-    for (size_t i = 0; i < sizeof(kw) / sizeof(kw[0]); ++i)
-        if (ContainsNoCase(text, kw[i]))
-            return true;
-
-    return false;
-}
-
-// Wszystkie interfejsy IPv4 w stanie Up (bez loopbacku), z flaga isVirtual.
+// Karty Up z IPv4. Wybor odbioru/wysylania pochodzi z settings.ini;
+// karta bez wpisu: fizyczna = wlaczona, wirtualna = wylaczona.
 static std::vector<IfAddr> EnumInterfaces()
 {
     std::vector<IfAddr> result;
+    const std::vector<NvrAdapter> ads = NvrEnumAdapters(false);
 
-    ULONG size = 16 * 1024;
-    std::vector<unsigned char> buf;
-    ULONG rc = ERROR_BUFFER_OVERFLOW;
-
-    for (int attempt = 0; attempt < 4 && rc == ERROR_BUFFER_OVERFLOW; ++attempt)
+    for (size_t i = 0; i < ads.size(); ++i)
     {
-        buf.resize(size);
-        rc = GetAdaptersAddresses(
-            AF_INET,
-            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-            nullptr,
-            reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()),
-            &size);
-    }
+        const bool def = !ads[i].isVirtual;
+        const bool rx = NvrAdapterAllowed(g_settings, ads[i].guid, def, false);
+        const bool tx = NvrAdapterAllowed(g_settings, ads[i].guid, def, true);
 
-    if (rc != NO_ERROR)
-        return result;
-
-    for (IP_ADAPTER_ADDRESSES* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
-         a; a = a->Next)
-    {
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK || a->OperStatus != IfOperStatusUp)
-            continue;
-
-        const bool isVirt = IsVirtualAdapter(a);
-
-        for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u; u = u->Next)
+        for (size_t k = 0; k < ads[i].addrs.size(); ++k)
         {
-            if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET)
-                continue;
-
-            const sockaddr_in* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
-
             IfAddr ia;
-            ia.ifIdx = a->IfIndex;
-            ia.ip = ntohl(sin->sin_addr.s_addr);
-            ia.isVirtual = isVirt;
-            ia.name = a->FriendlyName ? a->FriendlyName : L"";
-
-            unsigned prefix = u->OnLinkPrefixLength;
-            if (prefix > 32) prefix = 32;
-            ia.mask = prefix == 0 ? 0u : (0xFFFFFFFFu << (32 - prefix));
-
-            if (ia.ip != 0)
-                result.push_back(ia);
+            ia.ifIdx = ads[i].ifIdx;
+            ia.ip = ads[i].addrs[k].ip;
+            ia.mask = ads[i].addrs[k].mask;
+            ia.isVirtual = ads[i].isVirtual;
+            ia.rxAllowed = rx;
+            ia.txAllowed = tx;
+            ia.name = ads[i].name;
+            result.push_back(ia);
         }
     }
 
@@ -487,7 +400,8 @@ static uint64_t IfSignature(const std::vector<IfAddr>& v)
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < v.size(); ++i)
     {
-        const uint32_t parts[4] = { v[i].ifIdx, v[i].ip, v[i].mask, v[i].isVirtual ? 1u : 0u };
+        const uint32_t parts[4] = { v[i].ifIdx, v[i].ip, v[i].mask,
+                                    (v[i].rxAllowed ? 1u : 0u) | (v[i].txAllowed ? 2u : 0u) | (v[i].isVirtual ? 4u : 0u) };
         for (int k = 0; k < 4; ++k)
         {
             h ^= parts[k];
@@ -564,10 +478,12 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& all)
     r.directedBcast = false;
     r.failed = false;
 
-    // karty wirtualne sa pomijane przy wyborze wyjscia (exclude_virtual = yes)
+    r.noOutError = ERROR_NETWORK_UNREACHABLE;
+
+    // tylko karty z zaznaczonym "Wysylanie" w oknie konfiguracji
     std::vector<IfAddr> ifs;
     for (size_t i = 0; i < all.size(); ++i)
-        if (!(g_excludeVirtual.load() && all[i].isVirtual))
+        if (all[i].txAllowed)
             ifs.push_back(all[i]);
 
     const uint32_t dst = r.cfg.dstIp;
@@ -626,7 +542,24 @@ static void BuildOutputs(Rule& r, const std::vector<IfAddr>& all)
         }
     }
 
-    // 4) adres lokalny / loopback / interfejs wykluczony -> decyduje system
+    // 4) trasa prowadzi przez znana karte, ale wylaczona w konfiguracji -> nie wysylamy
+    //    (inaczej ruch wyciekalby przez karte, ktorej uzytkownik nie chce uzywac)
+    if (bestIf != 0)
+    {
+        for (size_t i = 0; i < all.size(); ++i)
+        {
+            if (all[i].ifIdx == bestIf && !all[i].txAllowed)
+            {
+                r.noOutError = NVR_ERR_ADAPTER_DISABLED;
+                Log("Reguła %s: trasa do celu prowadzi przez kartę '%s', która ma wyłączone wysyłanie - pakiety będą odrzucane",
+                    RuleName(r.cfg).c_str(), Utf8(all[i].name).c_str());
+                r.PublishTx();
+                return;
+            }
+        }
+    }
+
+    // 5) adres lokalny / loopback / nieznany interfejs -> decyduje system
     SOCKET s = MakeOutSocket(0, 0);
     if (s != INVALID_SOCKET)
     {
@@ -642,9 +575,11 @@ static void LogInterfaces(const std::vector<IfAddr>& v)
         Log("Interfejsy: brak aktywnych kart IPv4");
 
     for (size_t i = 0; i < v.size(); ++i)
-        Log("Interfejs [if %u] '%s' %s/%u %s", v[i].ifIdx, Utf8(v[i].name).c_str(),
-            NvrIpToString(v[i].ip).c_str(), 32 - (v[i].mask == 0 ? 32u : static_cast<unsigned>(__builtin_ctz(v[i].mask))),
-            v[i].isVirtual ? (g_excludeVirtual.load() ? "[wirtualna - POMIJANA]" : "[wirtualna]") : "[fizyczna]");
+        Log("Interfejs [if %u] '%s' %s/%u %s odbiór=%s wysyłanie=%s", v[i].ifIdx, Utf8(v[i].name).c_str(),
+            NvrIpToString(v[i].ip).c_str(),
+            32 - (v[i].mask == 0 ? 32u : static_cast<unsigned>(__builtin_ctz(v[i].mask))),
+            v[i].isVirtual ? "[wirtualna]" : "[fizyczna]",
+            v[i].rxAllowed ? "TAK" : "nie", v[i].txAllowed ? "TAK" : "nie");
 }
 
 static void LogOutputs(const Rule& r)
@@ -795,12 +730,12 @@ static void ForwardOne(Rule& r, const unsigned char* payload, UINT plen,
     if (r.outs.empty())
     {
         r.errors.fetch_add(1);
-        r.lastError.store(ERROR_NETWORK_UNREACHABLE);
-        r.failed = true;
-        needRefresh = true;
+        r.lastError.store(r.noOutError);
+        r.failed = (r.noOutError != NVR_ERR_ADAPTER_DISABLED);
+        needRefresh = needRefresh || r.failed;
         if (r.LogOk())
-            Log("BŁĄD: reguła %s nie ma żadnego interfejsu wyjściowego (brak sieci / karta wykluczona)",
-                RuleName(r.cfg).c_str());
+            Log("BŁĄD: reguła %s nie ma żadnego interfejsu wyjściowego: %s",
+                RuleName(r.cfg).c_str(), ErrStr(r.noOutError).c_str());
         return;
     }
 
@@ -914,11 +849,13 @@ static DWORD WINAPI RelayThread(void*)
             continue;
         }
 
-        // Pakiety z kart wirtualnych (exclude_virtual = yes)
-        if (g_excludeVirtual.load())
+        // Pakiety z kart, na ktorych odbior jest wylaczony w oknie konfiguracji.
+        // Karta nieznana (jeszcze nie na liscie) jest dopuszczana, a lista odswiezana.
         {
             const IfAddr* rx = FindIf(ifs, addr.ifIdx);
-            if (rx && rx->isVirtual)
+            if (!rx)
+                needRefresh = true;
+            else if (!rx->rxAllowed)
             {
                 g_totalLoop.fetch_add(1);
                 continue;
@@ -986,10 +923,8 @@ static void EnsureDefaultConfig()
         "# ip_docelowy może być broadcast (255.255.255.255 lub np. 192.168.1.255)\r\n"
         "# Komentarze: # lub ;\r\n"
         "#\r\n"
-        "# Ustawienia:\r\n"
-        "exclude_virtual = yes   # pomijaj karty wirtualne (VMware, VirtualBox, Hyper-V, VPN...)\r\n"
-        "max_pps = 2000          # limit pakietów/s na regułę (ochrona przed pętlą), 0 = bez limitu\r\n"
-        "log_max_kb = 512        # maks. rozmiar pliku logu w KB\r\n"
+        "# Karty sieciowe, limit logu i limit pakietów/s ustawiasz w oknie konfiguracji\r\n"
+        "# (menu ikony -> Edytuj konfigurację -> zakładki Karty sieciowe / Ustawienia).\r\n"
         "#\r\n"
         "# Przykłady reguł:\r\n"
         "# 0.0.0.0   1202 192.168.1.10   1203\r\n"
@@ -1047,9 +982,21 @@ static void LoadRules(bool keepCounters)
     if (haveFile)
         cfg = NvrParseConfig(text, NVR_MAX_RULES);
 
-    g_excludeVirtual.store(cfg.settings.excludeVirtual);
-    g_maxPps.store(cfg.settings.maxPps);
-    g_logMaxKb.store(cfg.settings.logMaxKb);
+    // settings.ini: karty (odbior/wysylanie), limit logu, limit pps
+    std::string setText;
+    NvrSettingsFile st;
+    const bool haveSettings = ReadFileUtf8(NvrSettingsPath(), setText);
+    if (haveSettings)
+        st = NvrParseSettings(setText);
+
+    g_settings = st;
+    g_maxPps.store(st.maxPps);
+    g_logMaxMb.store(st.logMaxMb);
+
+    if (!haveSettings)
+        Log("Brak settings.ini - ustawienia domyślne (karty fizyczne włączone, wirtualne wyłączone)");
+    for (size_t i = 0; i < st.errors.size() && i < 10; ++i)
+        Log("  %s", st.errors[i].c_str());
 
     RuleList fresh;
     for (size_t i = 0; i < cfg.rules.size(); ++i)
@@ -1102,9 +1049,9 @@ static void LoadRules(bool keepCounters)
         g_totalLoop.store(0);
     }
 
-    Log("Konfiguracja: %u reguł, %u błędnych linii, exclude_virtual=%s, max_pps=%u, log_max_kb=%u",
+    Log("Konfiguracja: %u reguł, %u błędnych linii; ustawienia: max_pps=%u, log_max_mb=%u, kart w settings.ini=%u",
         static_cast<unsigned>(cfg.rules.size()), static_cast<unsigned>(cfg.errors.size()),
-        cfg.settings.excludeVirtual ? "yes" : "no", cfg.settings.maxPps, cfg.settings.logMaxKb);
+        st.maxPps, st.logMaxMb, static_cast<unsigned>(st.adapters.size()));
 
     for (size_t i = 0; i < cfg.errors.size() && i < 20; ++i)
         Log("  odrzucono: %s", cfg.errors[i].c_str());
@@ -1348,9 +1295,8 @@ static uint32_t BuildReply(std::vector<unsigned char>& out, DWORD commandResult)
     h->active = g_active.load() ? 1u : 0u;
     h->lastError = g_lastError.load();
     h->userStopped = g_userStopped.load() ? 1u : 0u;
-    h->excludeVirtual = g_excludeVirtual.load() ? 1u : 0u;
     h->maxPps = g_maxPps.load();
-    h->logMaxKb = g_logMaxKb.load();
+    h->logMaxMb = g_logMaxMb.load();
     h->nowTime = NowFileTime();
     h->totalSeen = g_totalSeen.load();
     h->totalIgnored = g_totalIgnored.load();
