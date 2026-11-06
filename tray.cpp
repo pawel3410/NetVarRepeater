@@ -16,6 +16,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
+#include "adapters.h"
+
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -59,6 +61,8 @@ static const UINT ID_START     = 2002;
 static const UINT ID_STOP      = 2003;
 static const UINT ID_RESET     = 2004;
 static const UINT ID_EXIT      = 2005;
+static const UINT ID_LOG       = 2006;
+static const UINT ID_LOGDIR    = 2007;
 static const UINT ID_RULE_BASE = 3000;
 
 static const wchar_t* APP_TITLE = L"NetVar repeater";
@@ -93,10 +97,11 @@ static bool g_cmdBusy = false;
 static int g_promoTries = 0;
 
 // okna
-static HWND g_editor = nullptr, g_editCtl = nullptr, g_edHelp = nullptr, g_edInfo = nullptr;
+static HWND g_editor = nullptr, g_editCtl = nullptr, g_edHelp = nullptr, g_edInfo = nullptr, g_edTab = nullptr;
 static HWND g_edSave = nullptr, g_edApply = nullptr, g_edNext = nullptr, g_edClose = nullptr;
-static bool g_edDirty = false;
-static std::vector<int> g_edErrLines;
+static HWND g_adHelp = nullptr, g_adList = nullptr, g_adBtn[4] = { nullptr, nullptr, nullptr, nullptr };
+static HWND g_setHelp = nullptr, g_setLogLabel = nullptr, g_setLogEdit = nullptr;
+static HWND g_setPpsLabel = nullptr, g_setPpsEdit = nullptr, g_setOpenLog = nullptr;
 
 static HWND g_stWin = nullptr, g_stLabel = nullptr, g_stList = nullptr;
 static HWND g_stBtn[4] = { nullptr, nullptr, nullptr, nullptr };
@@ -148,6 +153,8 @@ static std::wstring ErrText(DWORD code)
 {
     if (code == NVR_ERR_NO_RULES)
         return L"brak poprawnych reguł w konfiguracji";
+    if (code == NVR_ERR_ADAPTER_DISABLED)
+        return L"trasa prowadzi przez kartę wyłączoną w konfiguracji (zakładka Karty sieciowe)";
 
     wchar_t buf[512];
     DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -711,9 +718,9 @@ static std::wstring BuildStatusHeader()
     }
     t += L"\r\nPrzechwycone pakiety: " + Num(s.h.totalSeen) + L"     bez pasującej reguły: " +
          Num(s.h.totalIgnored) + L"     odrzucone (pętla / karty wirtualne): " + Num(s.h.totalLoopDropped);
-    t += L"\r\nUstawienia: pomijanie kart wirtualnych: " + std::wstring(s.h.excludeVirtual ? L"tak" : L"nie") +
-         L"     limit: " + (s.h.maxPps ? Num(s.h.maxPps) + L" pakietów/s na regułę" : std::wstring(L"brak")) +
-         L"     log: " + Num(s.h.logMaxKb) + L" KB (" + NvrLogPath() + L")";
+    t += L"\r\nUstawienia: limit: " +
+         (s.h.maxPps ? Num(s.h.maxPps) + L" pakietów/s na regułę" : std::wstring(L"brak")) +
+         L"     log: do " + Num(s.h.logMaxMb) + L" MB (" + NvrLogPath() + L")";
 
     if (s.h.lastError != 0)
         t += L"\r\nBłąd: " + ErrText(s.h.lastError);
@@ -907,11 +914,101 @@ static void OpenStatusWindow()
 }
 
 // ------------------------------------------------------------
-// Edytor konfiguracji
+// Otwieranie logu
+// ------------------------------------------------------------
+static void OpenLog()
+{
+    const std::wstring path = NvrLogPath();
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        MessageBoxW(g_window, (L"Plik logu jeszcze nie istnieje:\n" + path).c_str(), APP_TITLE,
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+static void OpenLogFolder()
+{
+    const std::wstring path = NvrLogPath();
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+    else
+        ShellExecuteW(nullptr, L"open", NvrDataDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// ------------------------------------------------------------
+// Okno konfiguracji: zakladki Reguly / Karty sieciowe / Ustawienia
 // ------------------------------------------------------------
 static const int ID_ED_SAVE = 4001, ID_ED_APPLY = 4002, ID_ED_NEXT = 4003, ID_ED_CLOSE = 4004;
+static const int ID_AD_RX = 4010, ID_AD_TX = 4011, ID_AD_DEF = 4012, ID_AD_REFRESH = 4013;
+static const int ID_SET_OPENLOG = 4020;
+static const int ID_CTL_TAB = 6000, ID_CTL_RULES = 6001, ID_CTL_LOGMB = 6002, ID_CTL_PPS = 6003, ID_CTL_ADLIST = 6004;
 static const UINT_PTR ID_ED_TIMER = 1;
 
+struct AdRow
+{
+    std::string  guid;
+    std::wstring name, ip, state, type;
+    bool isVirtual, present, rx, tx;
+};
+
+static std::vector<AdRow> g_adRows;
+static NvrConfigResult g_edResult;
+static std::vector<int> g_edErrLines;
+static bool g_edDirty = false;     // zmieniono tekst regul (do ponownej walidacji)
+static bool g_setDirty = false;    // zmieniono karty / ustawienia
+static int  g_curTab = 0;
+
+static bool ReadSettingsFile(NvrSettingsFile& st)
+{
+    HANDLE h = CreateFileW(NvrSettingsPath().c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        st = NvrSettingsFile();
+        return false;
+    }
+
+    std::string raw;
+    char tmp[4096];
+    DWORD n = 0;
+    while (ReadFile(h, tmp, sizeof(tmp), &n, nullptr) && n > 0)
+        raw.append(tmp, n);
+    CloseHandle(h);
+
+    st = NvrParseSettings(raw);
+    return true;
+}
+
+static bool WriteTextFile(const std::wstring& path, const std::string& data)
+{
+    CreateDirectoryW(NvrDataDir().c_str(), nullptr);
+
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        const std::wstring msg = L"Nie można zapisać pliku:\n" + path + L"\n" + ErrText(GetLastError()) +
+                                 L"\n\nUruchom ponownie install.bat (nadaje prawa zapisu) lub edytuj plik jako administrator.";
+        MessageBoxW(g_editor, msg.c_str(), APP_TITLE, MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    DWORD written = 0;
+    const BOOL ok = WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &written, nullptr);
+    CloseHandle(h);
+
+    if (!ok || written != data.size())
+    {
+        MessageBoxW(g_editor, (L"Zapis pliku nie powiódł się:\n" + path).c_str(), APP_TITLE, MB_OK | MB_ICONERROR);
+        return false;
+    }
+    return true;
+}
+
+// ---- zakladka: Reguly ----
 static std::wstring LoadConfigForEditor()
 {
     std::string raw;
@@ -947,8 +1044,6 @@ static std::string EditorTextUtf8()
     return WideToUtf8(w);
 }
 
-static NvrConfigResult g_edResult;
-
 static void EditorRevalidate()
 {
     g_edResult = NvrParseConfig(EditorTextUtf8(), NVR_MAX_RULES);
@@ -964,21 +1059,35 @@ static void EditorRevalidate()
 
 static void EditorUpdateInfo()
 {
-    DWORD start = 0, end = 0;
-    SendMessageW(g_editCtl, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
-    const int line = static_cast<int>(SendMessageW(g_editCtl, EM_LINEFROMCHAR, start, 0)) + 1;
-    const int col = static_cast<int>(start) - static_cast<int>(SendMessageW(g_editCtl, EM_LINEINDEX, static_cast<WPARAM>(-1), 0)) + 1;
+    std::wstring t;
 
-    std::wstring t = L"Wiersz " + Num(line) + L", kolumna " + Num(col) + L"   |   Reguły: " +
-                     Num(g_edResult.rules.size()) + L"   |   ";
+    if (g_curTab == 0)
+    {
+        DWORD start = 0, end = 0;
+        SendMessageW(g_editCtl, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+        const int line = static_cast<int>(SendMessageW(g_editCtl, EM_LINEFROMCHAR, start, 0)) + 1;
+        const int col = static_cast<int>(start) -
+                        static_cast<int>(SendMessageW(g_editCtl, EM_LINEINDEX, static_cast<WPARAM>(-1), 0)) + 1;
 
-    if (g_edResult.errors.empty())
-        t += L"brak błędów";
+        t = L"Wiersz " + Num(line) + L", kolumna " + Num(col) + L"   |   Reguły: " +
+            Num(g_edResult.rules.size()) + L"   |   ";
+
+        if (g_edResult.errors.empty())
+            t += L"brak błędów";
+        else
+            t += L"BŁĘDY: " + Num(g_edResult.errors.size()) + L" - " + W(g_edResult.errors[0]);
+    }
+    else if (g_curTab == 1)
+    {
+        t = L"Kliknij ☑/☐ w kolumnie Odbiór lub Wysyłanie (albo użyj przycisków). Zmiany zapisz przyciskiem Zapisz.";
+    }
     else
-        t += L"BŁĘDY: " + Num(g_edResult.errors.size()) + L" - " + W(g_edResult.errors[0]);
+    {
+        t = L"Zmiany zapisz przyciskiem Zapisz; zastosuj je przez Start (lub Zapisz i zastosuj).";
+    }
 
-    wchar_t cur[512];
-    GetWindowTextW(g_edInfo, cur, 512);
+    wchar_t cur[600];
+    GetWindowTextW(g_edInfo, cur, 600);
     if (t != cur)
         SetWindowTextW(g_edInfo, t.c_str());
 
@@ -1012,14 +1121,179 @@ static void EditorNextError()
     EditorGotoLine(target);
 }
 
-static bool SaveConfigFromEditor()
+// ---- zakladka: Karty sieciowe ----
+static const int NADCOLS = 7;
+static const ColDef kAdCols[NADCOLS] =
 {
-    const std::string utf8 = EditorTextUtf8();
+    { L"Odbiór", 60, false }, { L"Wysyłanie", 80, false }, { L"Karta", 210, false },
+    { L"Adres IPv4", 130, false }, { L"Stan", 90, false }, { L"Typ", 200, false }, { L"GUID", 290, false }
+};
 
-    NvrConfigResult res = NvrParseConfig(utf8, NVR_MAX_RULES);
+static std::wstring AdCell(const AdRow& r, int c)
+{
+    switch (c)
+    {
+        case 0: return r.rx ? L"☑" : L"☐";
+        case 1: return r.tx ? L"☑" : L"☐";
+        case 2: return r.name;
+        case 3: return r.ip;
+        case 4: return r.state;
+        case 5: return r.type;
+        default: return W(r.guid);
+    }
+}
+
+static void LoadAdapterRows()
+{
+    NvrSettingsFile st;
+    ReadSettingsFile(st);
+
+    const std::vector<NvrAdapter> ads = NvrEnumAdapters(true);
+    g_adRows.clear();
+
+    for (size_t i = 0; i < ads.size(); ++i)
+    {
+        AdRow r;
+        r.guid = ads[i].guid;
+        r.name = ads[i].name;
+        r.ip = ads[i].addrs.empty() ? std::wstring(L"-") : W(NvrIpToString(ads[i].addrs[0].ip));
+        if (ads[i].addrs.size() > 1)
+            r.ip += L" (+" + Num(ads[i].addrs.size() - 1) + L")";
+        r.state = ads[i].up ? L"aktywna" : L"nieaktywna";
+        r.isVirtual = ads[i].isVirtual;
+        r.type = ads[i].isVirtual ? L"wirtualna (rozpoznana automatycznie)" : L"fizyczna";
+        r.present = true;
+        const bool def = !ads[i].isVirtual;
+        r.rx = NvrAdapterAllowed(st, ads[i].guid, def, false);
+        r.tx = NvrAdapterAllowed(st, ads[i].guid, def, true);
+        g_adRows.push_back(r);
+    }
+
+    // karty zapisane w settings.ini, ktorych teraz nie ma (odlaczone) - zeby mozna je ustawic z gory
+    for (size_t k = 0; k < st.adapters.size(); ++k)
+    {
+        bool found = false;
+        for (size_t i = 0; i < g_adRows.size(); ++i)
+            if (NvrLower(g_adRows[i].guid) == NvrLower(st.adapters[k].guid)) { found = true; break; }
+        if (found)
+            continue;
+
+        AdRow r;
+        r.guid = st.adapters[k].guid;
+        r.name = st.adapters[k].name.empty() ? W(st.adapters[k].guid) : Utf8ToWide(st.adapters[k].name);
+        r.ip = L"-";
+        r.state = L"nieobecna";
+        r.type = L"-";
+        r.isVirtual = false;
+        r.present = false;
+        r.rx = st.adapters[k].rx;
+        r.tx = st.adapters[k].tx;
+        g_adRows.push_back(r);
+    }
+}
+
+static void FillAdapterList()
+{
+    const int sel = ListView_GetNextItem(g_adList, -1, LVNI_SELECTED);
+
+    SendMessageW(g_adList, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(g_adList);
+
+    for (size_t i = 0; i < g_adRows.size(); ++i)
+    {
+        LVITEM it;
+        std::memset(&it, 0, sizeof(it));
+        it.mask = LVIF_TEXT;
+        it.iItem = static_cast<int>(i);
+        const std::wstring c0 = AdCell(g_adRows[i], 0);
+        it.pszText = const_cast<LPWSTR>(c0.c_str());
+        ListView_InsertItem(g_adList, &it);
+
+        for (int c = 1; c < NADCOLS; ++c)
+        {
+            const std::wstring t = AdCell(g_adRows[i], c);
+            ListView_SetItemText(g_adList, static_cast<int>(i), c, const_cast<LPWSTR>(t.c_str()));
+        }
+    }
+
+    if (sel >= 0 && sel < static_cast<int>(g_adRows.size()))
+        ListView_SetItemState(g_adList, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+
+    SendMessageW(g_adList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_adList, nullptr, TRUE);
+}
+
+static void ToggleAdapter(int item, bool tx)
+{
+    if (item < 0 || item >= static_cast<int>(g_adRows.size()))
+        return;
+
+    AdRow& r = g_adRows[static_cast<size_t>(item)];
+    if (tx) r.tx = !r.tx; else r.rx = !r.rx;
+
+    const int col = tx ? 1 : 0;
+    const std::wstring t = AdCell(r, col);
+    ListView_SetItemText(g_adList, item, col, const_cast<LPWSTR>(t.c_str()));
+    g_setDirty = true;
+}
+
+static void AdaptersDefaults()
+{
+    for (size_t i = 0; i < g_adRows.size(); ++i)
+    {
+        if (!g_adRows[i].present)
+            continue;
+        g_adRows[i].rx = !g_adRows[i].isVirtual;
+        g_adRows[i].tx = !g_adRows[i].isVirtual;
+    }
+    FillAdapterList();
+    g_setDirty = true;
+}
+
+// ---- zakladka: Ustawienia + zapis ----
+static bool CollectSettings(NvrSettingsFile& out, std::wstring& err)
+{
+    wchar_t b[32];
+
+    GetWindowTextW(g_setLogEdit, b, 32);
+    if (!NvrParseUInt(NvrTrim(WideToUtf8(b)), 1, 1024, out.logMaxMb))
+    {
+        err = L"Maksymalny rozmiar logu: podaj liczbę całkowitą MB od 1 do 1024.";
+        return false;
+    }
+
+    GetWindowTextW(g_setPpsEdit, b, 32);
+    if (!NvrParseUInt(NvrTrim(WideToUtf8(b)), 0, 1000000, out.maxPps))
+    {
+        err = L"Limit pakietów/s: podaj liczbę od 0 do 1000000 (0 = bez limitu).";
+        return false;
+    }
+
+    out.adapters.clear();
+    for (size_t i = 0; i < g_adRows.size(); ++i)
+    {
+        NvrAdapterSel a;
+        a.guid = g_adRows[i].guid;
+        a.rx = g_adRows[i].rx;
+        a.tx = g_adRows[i].tx;
+        a.name = WideToUtf8(g_adRows[i].name);
+        for (size_t k = 0; k < a.name.size(); ++k)
+            if (a.name[k] == '|' || a.name[k] == '\r' || a.name[k] == '\n') a.name[k] = '/';
+        out.adapters.push_back(a);
+    }
+    return true;
+}
+
+static void ShowTab(int t);
+
+static bool SaveAll()
+{
+    const std::string rulesUtf8 = EditorTextUtf8();
+
+    NvrConfigResult res = NvrParseConfig(rulesUtf8, NVR_MAX_RULES);
     if (!res.errors.empty())
     {
-        std::wstring msg = L"W konfiguracji są błędy (" + Num(res.errors.size()) + L"):\n\n";
+        std::wstring msg = L"W regułach są błędy (" + Num(res.errors.size()) + L"):\n\n";
         for (size_t i = 0; i < res.errors.size() && i < 10; ++i)
             msg += W(res.errors[i]) + L"\n";
         msg += L"\nBłędne linie zostaną pominięte przez usługę. Zapisać mimo to?";
@@ -1028,31 +1302,71 @@ static bool SaveConfigFromEditor()
             return false;
     }
 
-    CreateDirectoryW(NvrDataDir().c_str(), nullptr);
-
-    HANDLE h = CreateFileW(NvrConfigPath().c_str(), GENERIC_WRITE, 0, nullptr,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
+    NvrSettingsFile st;
+    std::wstring err;
+    if (!CollectSettings(st, err))
     {
-        const std::wstring msg = L"Nie można zapisać pliku:\n" + NvrConfigPath() + L"\n" +
-                                 ErrText(GetLastError()) +
-                                 L"\n\nUruchom ponownie install.bat (nadaje prawa zapisu) lub edytuj plik jako administrator.";
-        MessageBoxW(g_editor, msg.c_str(), APP_TITLE, MB_OK | MB_ICONERROR);
+        ShowTab(2);
+        MessageBoxW(g_editor, err.c_str(), APP_TITLE, MB_OK | MB_ICONWARNING);
         return false;
     }
 
-    DWORD written = 0;
-    const BOOL ok = WriteFile(h, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
-    CloseHandle(h);
-
-    if (!ok || written != utf8.size())
+    bool anyRx = false, anyTx = false;
+    for (size_t i = 0; i < g_adRows.size(); ++i)
     {
-        MessageBoxW(g_editor, L"Zapis pliku nie powiódł się.", APP_TITLE, MB_OK | MB_ICONERROR);
-        return false;
+        anyRx = anyRx || g_adRows[i].rx;
+        anyTx = anyTx || g_adRows[i].tx;
     }
+    if (!anyRx || !anyTx)
+    {
+        const std::wstring msg = std::wstring(L"Żadna karta nie ma włączonego ") +
+                                 (!anyRx ? L"odbioru" : L"wysyłania") +
+                                 L" - nic nie będzie przekazywane.\nZapisać mimo to?";
+        if (MessageBoxW(g_editor, msg.c_str(), APP_TITLE, MB_YESNO | MB_ICONWARNING) != IDYES)
+        {
+            ShowTab(1);
+            return false;
+        }
+    }
+
+    if (!WriteTextFile(NvrConfigPath(), rulesUtf8))
+        return false;
+    if (!WriteTextFile(NvrSettingsPath(), NvrFormatSettings(st)))
+        return false;
 
     SendMessageW(g_editCtl, EM_SETMODIFY, FALSE, 0);
+    g_setDirty = false;
     return true;
+}
+
+// ---- okno ----
+static void ShowTab(int t)
+{
+    g_curTab = t;
+    TabCtrl_SetCurSel(g_edTab, t);
+
+    const int r = (t == 0) ? SW_SHOW : SW_HIDE;
+    const int a = (t == 1) ? SW_SHOW : SW_HIDE;
+    const int s = (t == 2) ? SW_SHOW : SW_HIDE;
+
+    ShowWindow(g_edHelp, r);
+    ShowWindow(g_editCtl, r);
+    ShowWindow(g_edNext, r);
+
+    ShowWindow(g_adHelp, a);
+    ShowWindow(g_adList, a);
+    for (int i = 0; i < 4; ++i)
+        ShowWindow(g_adBtn[i], a);
+
+    ShowWindow(g_setHelp, s);
+    ShowWindow(g_setLogLabel, s);
+    ShowWindow(g_setLogEdit, s);
+    ShowWindow(g_setPpsLabel, s);
+    ShowWindow(g_setPpsEdit, s);
+    ShowWindow(g_setOpenLog, s);
+
+    SetFocus(t == 0 ? g_editCtl : t == 1 ? g_adList : g_setLogEdit);
+    EditorUpdateInfo();
 }
 
 static void LayoutEditor(HWND hwnd)
@@ -1061,13 +1375,49 @@ static void LayoutEditor(HWND hwnd)
     GetClientRect(hwnd, &rc);
     const int w = rc.right, h = rc.bottom;
 
-    MoveWindow(g_edHelp, 8, 6, w - 16, 50, TRUE);
-    MoveWindow(g_editCtl, 8, 58, w - 16, h - 58 - 28 - 46, TRUE);
-    MoveWindow(g_edInfo, 8, h - 46 - 22, w - 16, 20, TRUE);
+    MoveWindow(g_edTab, 8, 6, w - 16, h - 6 - 74, TRUE);
+
+    RECT pg = { 8, 6, w - 8, h - 74 + 6 };
+    TabCtrl_AdjustRect(g_edTab, FALSE, &pg);
+
+    const int x0 = pg.left + 6, y0 = pg.top + 6;
+    const int pw = (pg.right - 6) - x0, ph = (pg.bottom - 6) - y0;
+
+    // Reguly
+    MoveWindow(g_edHelp, x0, y0, pw, 34, TRUE);
+    MoveWindow(g_editCtl, x0, y0 + 38, pw, ph - 38, TRUE);
+
+    // Karty
+    MoveWindow(g_adHelp, x0, y0, pw, 34, TRUE);
+    MoveWindow(g_adList, x0, y0 + 38, pw, ph - 38 - 36, TRUE);
+    const int by = y0 + ph - 30;
+    MoveWindow(g_adBtn[0], x0, by, 150, 28, TRUE);
+    MoveWindow(g_adBtn[1], x0 + 156, by, 160, 28, TRUE);
+    MoveWindow(g_adBtn[2], x0 + 322, by, 170, 28, TRUE);
+    MoveWindow(g_adBtn[3], x0 + 498, by, 130, 28, TRUE);
+
+    // Ustawienia
+    MoveWindow(g_setHelp, x0, y0, pw, 34, TRUE);
+    MoveWindow(g_setLogLabel, x0, y0 + 52, 330, 22, TRUE);
+    MoveWindow(g_setLogEdit, x0 + 340, y0 + 48, 80, 24, TRUE);
+    MoveWindow(g_setPpsLabel, x0, y0 + 90, 330, 22, TRUE);
+    MoveWindow(g_setPpsEdit, x0 + 340, y0 + 86, 80, 24, TRUE);
+    MoveWindow(g_setOpenLog, x0, y0 + 132, 150, 28, TRUE);
+
+    MoveWindow(g_edInfo, 8, h - 68, w - 16, 20, TRUE);
     MoveWindow(g_edSave,  8, h - 38, 100, 30, TRUE);
     MoveWindow(g_edApply, 114, h - 38, 190, 30, TRUE);
     MoveWindow(g_edNext,  310, h - 38, 130, 30, TRUE);
     MoveWindow(g_edClose, w - 108, h - 38, 100, 30, TRUE);
+}
+
+static HWND MakeChild(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, DWORD exStyle, int id, HFONT font)
+{
+    HWND c = CreateWindowExW(exStyle, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, parent,
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_inst, nullptr);
+    if (c)
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    return c;
 }
 
 static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1076,41 +1426,88 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         case WM_CREATE:
         {
-            g_edHelp = CreateWindowExW(0, L"STATIC",
+            g_edTab = MakeChild(hwnd, WC_TABCONTROLW, L"", WS_CLIPSIBLINGS | WS_TABSTOP, 0, ID_CTL_TAB, g_uiFont);
+            const wchar_t* tabs[3] = { L"Reguły", L"Karty sieciowe", L"Ustawienia" };
+            for (int i = 0; i < 3; ++i)
+            {
+                TCITEM ti;
+                std::memset(&ti, 0, sizeof(ti));
+                ti.mask = TCIF_TEXT;
+                ti.pszText = const_cast<LPWSTR>(tabs[i]);
+                TabCtrl_InsertItem(g_edTab, i, &ti);
+            }
+
+            // Reguly
+            g_edHelp = MakeChild(hwnd, L"STATIC",
                 L"Reguła: ip_nadawcy port_odbiorczy ip_docelowy port_docelowy   (0.0.0.0 = dowolny nadawca, "
-                L"ip docelowy może być broadcast, # = komentarz)\r\n"
-                L"Ustawienia: exclude_virtual = yes|no,  max_pps = N (0 = bez limitu),  log_max_kb = N.   "
-                L"Skróty: Ctrl+S zapisz, Ctrl+A zaznacz wszystko, Esc zamknij, Ctrl+Tab do przycisków.",
-                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, hwnd, nullptr, g_inst, nullptr);
+                L"ip docelowy może być broadcast, # = komentarz).  Skróty: Ctrl+S zapisz, Ctrl+A zaznacz wszystko, "
+                L"Esc zamknij, Ctrl+Tab do przycisków.",
+                SS_LEFT | SS_NOPREFIX, 0, 0, g_uiFont);
+            g_editCtl = MakeChild(hwnd, L"EDIT", L"",
+                WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL |
+                ES_WANTRETURN | ES_NOHIDESEL, WS_EX_CLIENTEDGE, ID_CTL_RULES, g_monoFont);
 
-            g_editCtl = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
-                ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | ES_NOHIDESEL,
-                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(6001)), g_inst, nullptr);
+            // Karty
+            g_adHelp = MakeChild(hwnd, L"STATIC",
+                L"Zaznacz karty, na których program ma ODBIERAĆ pakiety i/lub z których ma je WYSYŁAĆ. "
+                L"Nowa karta bez wpisu: fizyczna = włączona, wirtualna = wyłączona. Karty nieobecne (odłączone) można ustawić z góry.",
+                SS_LEFT | SS_NOPREFIX, 0, 0, g_uiFont);
+            g_adList = MakeChild(hwnd, WC_LISTVIEWW, L"",
+                WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE, ID_CTL_ADLIST, g_uiFont);
+            ListView_SetExtendedListViewStyle(g_adList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+            for (int c = 0; c < NADCOLS; ++c)
+            {
+                LVCOLUMN col;
+                std::memset(&col, 0, sizeof(col));
+                col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+                col.fmt = LVCFMT_LEFT;
+                col.cx = kAdCols[c].width;
+                col.pszText = const_cast<LPWSTR>(kAdCols[c].title);
+                ListView_InsertColumn(g_adList, c, &col);
+            }
+            g_adBtn[0] = MakeChild(hwnd, L"BUTTON", L"Odbiór: przełącz", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_AD_RX, g_uiFont);
+            g_adBtn[1] = MakeChild(hwnd, L"BUTTON", L"Wysyłanie: przełącz", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_AD_TX, g_uiFont);
+            g_adBtn[2] = MakeChild(hwnd, L"BUTTON", L"Domyślne (fizyczne)", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_AD_DEF, g_uiFont);
+            g_adBtn[3] = MakeChild(hwnd, L"BUTTON", L"Odśwież listę", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_AD_REFRESH, g_uiFont);
 
-            g_edInfo = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-                0, 0, 0, 0, hwnd, nullptr, g_inst, nullptr);
+            // Ustawienia
+            g_setHelp = MakeChild(hwnd, L"STATIC",
+                L"Plik logu po przekroczeniu limitu jest przenoszony do .log.1 (poprzedni .log.1 jest nadpisywany), "
+                L"więc log zajmie najwyżej ok. 2 x limit.", SS_LEFT | SS_NOPREFIX, 0, 0, g_uiFont);
+            g_setLogLabel = MakeChild(hwnd, L"STATIC", L"Maksymalny rozmiar pliku logu [MB, 1-1024]:", SS_LEFT | SS_NOPREFIX, 0, 0, g_uiFont);
+            g_setLogEdit = MakeChild(hwnd, L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_CTL_LOGMB, g_uiFont);
+            g_setPpsLabel = MakeChild(hwnd, L"STATIC", L"Limit pakietów/s na regułę (ochrona przed pętlą, 0 = bez limitu):", SS_LEFT | SS_NOPREFIX, 0, 0, g_uiFont);
+            g_setPpsEdit = MakeChild(hwnd, L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_CTL_PPS, g_uiFont);
+            g_setOpenLog = MakeChild(hwnd, L"BUTTON", L"Otwórz log", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_SET_OPENLOG, g_uiFont);
+            SendMessageW(g_setLogEdit, EM_SETLIMITTEXT, 4, 0);
+            SendMessageW(g_setPpsEdit, EM_SETLIMITTEXT, 7, 0);
 
-            g_edSave = CreateWindowExW(0, L"BUTTON", L"Zapisz", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ED_SAVE)), g_inst, nullptr);
-            g_edApply = CreateWindowExW(0, L"BUTTON", L"Zapisz i zastosuj (Start)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ED_APPLY)), g_inst, nullptr);
-            g_edNext = CreateWindowExW(0, L"BUTTON", L"Następny błąd", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ED_NEXT)), g_inst, nullptr);
-            g_edClose = CreateWindowExW(0, L"BUTTON", L"Zamknij", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ED_CLOSE)), g_inst, nullptr);
+            // Wspolne
+            g_edInfo = MakeChild(hwnd, L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 0, 0, g_uiFont);
+            g_edSave = MakeChild(hwnd, L"BUTTON", L"Zapisz", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_ED_SAVE, g_uiFont);
+            g_edApply = MakeChild(hwnd, L"BUTTON", L"Zapisz i zastosuj (Start)", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_ED_APPLY, g_uiFont);
+            g_edNext = MakeChild(hwnd, L"BUTTON", L"Następny błąd", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_ED_NEXT, g_uiFont);
+            g_edClose = MakeChild(hwnd, L"BUTTON", L"Zamknij", WS_TABSTOP | BS_PUSHBUTTON, 0, ID_ED_CLOSE, g_uiFont);
 
-            HWND all[] = { g_edHelp, g_edInfo, g_edSave, g_edApply, g_edNext, g_edClose };
-            for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); ++i)
-                SendMessageW(all[i], WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
-            SendMessageW(g_editCtl, WM_SETFONT, reinterpret_cast<WPARAM>(g_monoFont), TRUE);
-
+            // dane
             SendMessageW(g_editCtl, EM_SETLIMITTEXT, 1024 * 1024, 0);
             SetWindowTextW(g_editCtl, LoadConfigForEditor().c_str());
             SendMessageW(g_editCtl, EM_SETMODIFY, FALSE, 0);
 
+            NvrSettingsFile st;
+            ReadSettingsFile(st);
+            SetWindowTextW(g_setLogEdit, Num(st.logMaxMb).c_str());
+            SetWindowTextW(g_setPpsEdit, Num(st.maxPps).c_str());
+
+            LoadAdapterRows();
+            FillAdapterList();
+
             EditorRevalidate();
-            EditorUpdateInfo();
+            g_curTab = 0;
+            LayoutEditor(hwnd);
+            ShowTab(0);
+            g_setDirty = false;
+            g_edDirty = false;
             SetTimer(hwnd, ID_ED_TIMER, 300, nullptr);
             return 0;
         }
@@ -1122,13 +1519,13 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_GETMINMAXINFO:
         {
             MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-            mmi->ptMinTrackSize.x = 560;
-            mmi->ptMinTrackSize.y = 320;
+            mmi->ptMinTrackSize.x = 700;
+            mmi->ptMinTrackSize.y = 380;
             return 0;
         }
 
         case WM_SETFOCUS:
-            SetFocus(g_editCtl);
+            SetFocus(g_curTab == 0 ? g_editCtl : g_curTab == 1 ? g_adList : g_setLogEdit);
             return 0;
 
         case WM_TIMER:
@@ -1143,6 +1540,42 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             return 0;
 
+        case WM_NOTIFY:
+        {
+            NMHDR* nh = reinterpret_cast<NMHDR*>(lp);
+
+            if (nh->hwndFrom == g_edTab && nh->code == TCN_SELCHANGE)
+            {
+                ShowTab(TabCtrl_GetCurSel(g_edTab));
+            }
+            else if (nh->hwndFrom == g_adList && nh->code == NM_CLICK)
+            {
+                NMITEMACTIVATE* ia = reinterpret_cast<NMITEMACTIVATE*>(lp);
+                LVHITTESTINFO ht;
+                std::memset(&ht, 0, sizeof(ht));
+                ht.pt = ia->ptAction;
+                ListView_SubItemHitTest(g_adList, &ht);
+                if (ht.iItem >= 0)
+                {
+                    if (ht.iSubItem == 0) ToggleAdapter(ht.iItem, false);
+                    else if (ht.iSubItem == 1) ToggleAdapter(ht.iItem, true);
+                }
+            }
+            else if (nh->hwndFrom == g_adList && nh->code == LVN_KEYDOWN)
+            {
+                NMLVKEYDOWN* kd = reinterpret_cast<NMLVKEYDOWN*>(lp);
+                const int sel = ListView_GetNextItem(g_adList, -1, LVNI_SELECTED);
+                if (sel >= 0)
+                {
+                    if (kd->wVKey == VK_SPACE || kd->wVKey == 'R' || kd->wVKey == 'O')
+                        ToggleAdapter(sel, false);
+                    else if (kd->wVKey == 'W' || kd->wVKey == 'T')
+                        ToggleAdapter(sel, true);
+                }
+            }
+            return 0;
+        }
+
         case WM_COMMAND:
             if (lp != 0 && reinterpret_cast<HWND>(lp) == g_editCtl)
             {
@@ -1150,21 +1583,59 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     g_edDirty = true;
                 return 0;
             }
+            if (lp != 0 && (reinterpret_cast<HWND>(lp) == g_setLogEdit || reinterpret_cast<HWND>(lp) == g_setPpsEdit))
+            {
+                if (HIWORD(wp) == EN_CHANGE)
+                    g_setDirty = true;
+                return 0;
+            }
 
             switch (LOWORD(wp))
             {
                 case ID_ED_SAVE:
-                    SaveConfigFromEditor();
+                    SaveAll();
                     return 0;
 
                 case ID_ED_APPLY:
-                    if (SaveConfigFromEditor())
+                    if (SaveAll())
                         StartCommand(NVR_CMD_START);
                     return 0;
 
                 case ID_ED_NEXT:
                     EditorRevalidate();
                     EditorNextError();
+                    return 0;
+
+                case ID_AD_RX:
+                    ToggleAdapter(ListView_GetNextItem(g_adList, -1, LVNI_SELECTED), false);
+                    return 0;
+
+                case ID_AD_TX:
+                    ToggleAdapter(ListView_GetNextItem(g_adList, -1, LVNI_SELECTED), true);
+                    return 0;
+
+                case ID_AD_DEF:
+                    AdaptersDefaults();
+                    return 0;
+
+                case ID_AD_REFRESH:
+                {
+                    // zachowaj biezace wybory uzytkownika dla kart, ktore juz sa na liscie
+                    std::vector<AdRow> old = g_adRows;
+                    LoadAdapterRows();
+                    for (size_t i = 0; i < g_adRows.size(); ++i)
+                        for (size_t k = 0; k < old.size(); ++k)
+                            if (NvrLower(old[k].guid) == NvrLower(g_adRows[i].guid))
+                            {
+                                g_adRows[i].rx = old[k].rx;
+                                g_adRows[i].tx = old[k].tx;
+                            }
+                    FillAdapterList();
+                    return 0;
+                }
+
+                case ID_SET_OPENLOG:
+                    OpenLog();
                     return 0;
 
                 case ID_ED_CLOSE:
@@ -1175,13 +1646,13 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
 
         case WM_CLOSE:
-            if (SendMessageW(g_editCtl, EM_GETMODIFY, 0, 0))
+            if (SendMessageW(g_editCtl, EM_GETMODIFY, 0, 0) || g_setDirty)
             {
                 const int r = MessageBoxW(hwnd, L"Zapisać zmiany w konfiguracji?", APP_TITLE,
                                           MB_YESNOCANCEL | MB_ICONQUESTION);
                 if (r == IDCANCEL)
                     return 0;
-                if (r == IDYES && !SaveConfigFromEditor())
+                if (r == IDYES && !SaveAll())
                     return 0;
             }
             DestroyWindow(hwnd);
@@ -1191,6 +1662,7 @@ static LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             KillTimer(hwnd, ID_ED_TIMER);
             g_editor = nullptr;
             g_editCtl = nullptr;
+            g_adList = nullptr;
             return 0;
     }
 
@@ -1207,7 +1679,7 @@ static void OpenEditor()
     }
 
     g_editor = CreateWindowExW(0, L"NvrEditor", L"NetVar repeater - konfiguracja",
-                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 520,
+                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 860, 560,
                                nullptr, nullptr, g_inst, nullptr);
     if (g_editor)
     {
@@ -1216,7 +1688,7 @@ static void OpenEditor()
     }
 }
 
-// Skroty klawiszowe okien edytora i statusu (wolane z petli komunikatow).
+// Skroty klawiszowe okien konfiguracji i statusu (wolane z petli komunikatow).
 static bool HandleKeys(MSG& m)
 {
     if (g_editor && (m.hwnd == g_editor || IsChild(g_editor, m.hwnd)))
@@ -1235,18 +1707,20 @@ static bool HandleKeys(MSG& m)
                 PostMessageW(g_editor, WM_COMMAND, ID_ED_SAVE, 0);
                 return true;
             }
-            if (m.hwnd == g_editCtl && ctrl)
+            if (ctrl && m.wParam == 'A')
             {
-                if (m.wParam == 'A')
+                wchar_t cls[16];
+                GetClassNameW(m.hwnd, cls, 16);
+                if (_wcsicmp(cls, L"Edit") == 0)
                 {
-                    SendMessageW(g_editCtl, EM_SETSEL, 0, static_cast<LPARAM>(-1));
+                    SendMessageW(m.hwnd, EM_SETSEL, 0, static_cast<LPARAM>(-1));
                     return true;
                 }
-                if (m.wParam == VK_TAB)
-                {
-                    SetFocus(g_edSave);
-                    return true;
-                }
+            }
+            if (ctrl && m.wParam == VK_TAB)
+            {
+                SetFocus(g_edSave);
+                return true;
             }
         }
 
@@ -1311,7 +1785,9 @@ static void ShowMenu(POINT pt)
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
                     (L"   błędne linie: " + Num(cfg.errors.size())).c_str());
 
-    AppendMenuW(menu, MF_STRING, ID_EDIT, L"Edytuj konfigurację...");
+    AppendMenuW(menu, MF_STRING, ID_EDIT, L"Edytuj konfigurację (reguły, karty, ustawienia)...");
+    AppendMenuW(menu, MF_STRING, ID_LOG, L"Otwórz log");
+    AppendMenuW(menu, MF_STRING, ID_LOGDIR, L"Otwórz folder logu");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     AppendMenuW(menu, MF_STRING | (avail ? 0 : MF_GRAYED), ID_START, L"Start (wczytaj konfigurację)");
@@ -1471,6 +1947,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             {
                 case ID_STATUSWIN: OpenStatusWindow();         return 0;
                 case ID_EDIT:      OpenEditor();               return 0;
+                case ID_LOG:       OpenLog();                  return 0;
+                case ID_LOGDIR:    OpenLogFolder();            return 0;
                 case ID_START:     StartCommand(NVR_CMD_START); return 0;
                 case ID_STOP:      StartCommand(NVR_CMD_STOP);  return 0;
                 case ID_RESET:     StartCommand(NVR_CMD_RESET); return 0;
@@ -1505,7 +1983,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_LISTVIEW_CLASSES;
+    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES;
     InitCommonControlsEx(&icc);
 
     NONCLIENTMETRICSW ncm;
