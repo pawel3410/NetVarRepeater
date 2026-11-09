@@ -31,7 +31,7 @@ Po kompilacji w tym samym katalogu powstają `NetVarRepeaterService.exe` i `NetV
 
 ### Ikona, okienka i menu
 
-- Ikona ma napis „NV” (na 16×16 pełna nazwa się nie mieści), pełne „NetVar repeater” jest w tooltipie i tytułach okien. Kolor: szary – usługa niedostępna, pomarańczowy – zatrzymany / nie działa, zielony – aktywny, czerwony – aktywny z błędami wysyłania.
+- Ikona ma napis „NV” (na 16×16 pełna nazwa się nie mieści), pełne „NetVar repeater” jest w tooltipie i tytułach okien. Kolor: **szary** – usługa niedostępna lub przekazywanie nie działa (zatrzymane / błąd startu), **zielony** – przekazywanie działa. Błędy wysyłania nie zmieniają koloru – widać je w okienku przy najechaniu i w oknie statusu.
 - **Najechanie**: zwarte okienko – stan, start, czas pracy, błędy, liczniki ogólne i po dwie linie na regułę (liczniki + karta odbiorcza → karty wysyłające z adresami IP).
 - **Kliknięcie ikony**: okno statusu (tabela wszystkich reguł: odebrane, przekazane, błędy, pominięte, dane odebrane/wysłane, karta odbiorcza i wysyłająca z IP i indeksem) z przyciskami Start/Stop/Reset/Edytuj. Odświeża się co 2 s bez migotania.
 - **Prawy przycisk**: status, lista reguł (kliknięcie otwiera edytor), `Edytuj konfigurację (reguły, karty, ustawienia)...`, `Otwórz log`, `Otwórz folder logu`, **Start** (wczytuje konfigurację), **Stop**, **Reset** (wczytuje konfigurację i zeruje liczniki; stan Start/Stop bez zmian), `Zamknij ikonę`.
