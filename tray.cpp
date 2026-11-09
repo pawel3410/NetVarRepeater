@@ -422,28 +422,26 @@ static HICON MakeIcon(COLORREF color)
     return icon;
 }
 
-// 0 = usluga niedostepna, 1 = zatrzymane / nie dziala, 2 = aktywne, 3 = aktywne z bledami
+// 0 = szara (usluga niedostepna lub przekazywanie nie dziala), 1 = zielona (dziala)
+// Bledy wysylania NIE zmieniaja koloru - widac je w oknie przy najechaniu i w oknie statusu.
 static int StateOf(const Snapshot& s)
 {
-    if (!s.ok) return 0;
-    if (!s.h.active) return 1;
-    for (size_t i = 0; i < s.rules.size(); ++i)
-        if (s.rules[i].errors > 0) return 3;
-    return 2;
+    return (s.ok && s.h.active) ? 1 : 0;
 }
 
 static void ApplyIconState(bool force)
 {
     const int st = StateOf(g_snap);
-    if (!force && st == g_iconState)
+
+    const wchar_t* tip = !g_snap.ok          ? L"NetVar repeater - usługa niedostępna"
+                       : !g_snap.h.active    ? L"NetVar repeater - zatrzymany"
+                       :                       L"NetVar repeater - aktywny";
+
+    if (!force && st == g_iconState && std::wcscmp(tip, g_nid.szTip) == 0)
         return;
 
     g_iconState = st;
     g_nid.hIcon = g_icons[st];
-
-    const wchar_t* tip = st == 0 ? L"NetVar repeater - usługa niedostępna"
-                       : st == 1 ? L"NetVar repeater - zatrzymany"
-                       :           L"NetVar repeater - aktywny";
     std::wcsncpy(g_nid.szTip, tip, 127);
     g_nid.szTip[127] = 0;
 
@@ -1995,10 +1993,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              FIXED_PITCH | FF_MODERN, L"Consolas");
 
-    g_icons[0] = MakeIcon(RGB(110, 110, 110));   // niedostepna
-    g_icons[1] = MakeIcon(RGB(200, 115, 0));     // zatrzymana / nie dziala
-    g_icons[2] = MakeIcon(RGB(25, 135, 50));     // aktywna
-    g_icons[3] = MakeIcon(RGB(190, 30, 30));     // aktywna z bledami
+    g_icons[0] = MakeIcon(RGB(110, 110, 110));   // szara: usluga niedostepna / nie dziala
+    g_icons[1] = MakeIcon(RGB(25, 135, 50));     // zielona: dziala
 
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
